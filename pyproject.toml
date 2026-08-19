@@ -1,0 +1,52 @@
+[project]
+name = "splatad-kernel"
+version = "1.0.0"
+description = "SplatAD's spherical LiDAR rasterizer as a standalone package"
+readme = "README.md"
+authors = [{ name = "Masaya Kataoka", email = "ms.kataoka@gmail.com" }]
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    # The CUDA extension is built by torch.utils.cpp_extension at import time,
+    # so torch is a runtime dependency, not just a build-time one. No version is
+    # pinned here: the consumer picks the torch (and therefore the CUDA) it
+    # wants, and the extension compiles against whatever is installed. A
+    # consumer that pins torch should pin it in ITS OWN resolution, the way
+    # splatsim does with a build-constraint on the CUDA 12.x series.
+    "torch",
+    # The JIT build reports progress through rich, and the wrappers annotate
+    # with typing_extensions.Literal. Both usually arrive with torch, but this
+    # package imports them directly.
+    "rich",
+    "typing_extensions",
+    # ninja drives the JIT compile.
+    "ninja",
+    "numpy",
+    "jaxtyping",
+]
+
+[project.urls]
+Homepage = "https://github.com/hakuturu583/splatad_kernel"
+Upstream = "https://github.com/carlinds/splatad"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# The CUDA sources and the vendored GLM headers must ship with the package:
+# the extension is compiled from them on the machine that imports it.
+[tool.setuptools.package-data]
+splatad_kernel = [
+    "cuda/csrc/*.cu",
+    "cuda/csrc/*.cuh",
+    "cuda/csrc/*.cpp",
+    "cuda/csrc/*.h",
+    "cuda/csrc/third_party/glm/**/*",
+]
+
+[tool.ruff]
+# Kept close to upstream so diffs against SplatAD stay readable.
+exclude = ["src/splatad_kernel/cuda/csrc"]

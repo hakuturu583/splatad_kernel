@@ -1,0 +1,33 @@
+splatad_kernel
+Copyright 2026 Masaya Kataoka
+
+This product includes software developed as part of SplatAD.
+
+--------------------------------------------------------------------------------
+SplatAD  (https://github.com/carlinds/splatad)
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+SplatAD is itself a fork of gsplat (https://github.com/nerfstudio-project/gsplat),
+also Apache-2.0.
+
+This repository contains a MODIFIED subset of that work. Changes made:
+
+  * Reduced to the LiDAR path. The camera/RGB rasterizer, training strategies,
+    compression, distributed helpers and profiling utilities were removed; what
+    remains is the spherical LiDAR projection, tile binning and point
+    rasterization plus the code they need.
+  * Python package renamed  gsplat -> splatad_kernel, and the CUDA extension
+    renamed  gsplat_cuda -> splatad_kernel_cuda, so this can be installed
+    alongside an ordinary gsplat without either colliding.
+  * Inference-side performance work on the LiDAR rasterizer and tile binner
+    (shared-memory staging and packing, an exponential-free rejection test, an
+    elevation fold for one-beam-row tiles, and per-beam rather than per-bounding
+    box azimuth binning). See the git history for what each change was measured
+    to be worth.
+  * Rolling shutter reached through the existing per-column sweep-time input.
+
+--------------------------------------------------------------------------------
+OpenGL Mathematics (GLM)  (https://github.com/g-truc/glm)
+Vendored, headers only, under src/splatad_kernel/cuda/csrc/third_party/glm.
+Licensed under the MIT License / The Happy Bunny License -- see that directory's
+copying.txt for the full terms.
