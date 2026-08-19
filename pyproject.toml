@@ -1,6 +1,6 @@
 [project]
 name = "splatad-kernel"
-version = "1.0.0"
+version = "1.0.1"
 description = "SplatAD's spherical LiDAR rasterizer as a standalone package"
 readme = "README.md"
 authors = [{ name = "Masaya Kataoka", email = "ms.kataoka@gmail.com" }]
