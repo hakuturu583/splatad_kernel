@@ -126,10 +126,13 @@ rasterize_to_points_bwd_tensor(
     // forward outputs
     const torch::Tensor &render_alphas, // [C, image_height, image_width, 1]
     const torch::Tensor &last_ids,      // [C, image_height, image_width]
+    const at::optional<torch::Tensor> &fr_depth,  // [C, image_height, image_width, 1]
+    const at::optional<torch::Tensor> &fr_weight, // [C, image_height, image_width, 1]
     // gradients of outputs
     const torch::Tensor &v_render_colors, // [C, image_height, image_width, 3]
     const torch::Tensor &v_render_alphas, // [C, image_height, image_width, 1]
     const torch::Tensor &v_alpha_sum_until_points, // [C, image_height, image_width, 1])
+    const at::optional<torch::Tensor> &v_fr_depth, // [C, image_height, image_width, 1]
     // options
     bool absgrad,
     const bool compute_alpha_sum_until_points,

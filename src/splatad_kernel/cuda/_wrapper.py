@@ -706,9 +706,10 @@ class _RasterizeToPoints(torch.autograd.Function):
         alpha_sum_until_points = (
             alpha_sum_until_points.float() if compute_alpha_sum_until_points else None
         )
-        # fr_depth (soft-first-return) is FORWARD-ONLY for now (prototype): non-diff until
-        # the backward (v_fr_depth) lands. fr_weight is internal (saved for that backward).
-        ctx.mark_non_differentiable(fr_depth)
+        # fr_depth (soft-first-return) is DIFFERENTIABLE: its v_fr_depth backward propagates to
+        # means/opacity/scale over the first-surface prefix. fr_weight is internal (saved for the
+        # backward's 1/D normalization). median_depths carries no grad (hard selection; the
+        # backward returns None for it) — deploy/BEV only.
         return render_colors, render_alphas, alpha_sum_until_points, median_depths, fr_depth
 
     @staticmethod
@@ -718,7 +719,7 @@ class _RasterizeToPoints(torch.autograd.Function):
         v_render_alphas: Tensor,  # [C, H, W, 1]
         v_alpha_sum_until_points: Tensor,  # [C, H, W, 1]
         v_median_depths: Tensor,  # [C, H, W, 1]
-        v_fr_depth: Tensor,  # [C, H, W, 1] (forward-only prototype; ignored until backward lands)
+        v_fr_depth: Tensor,  # [C, H, W, 1] upstream grad of soft-first-return depth (-> means/opacity/scale)
     ):
         (
             means2d,
@@ -772,11 +773,14 @@ class _RasterizeToPoints(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
+            fr_depth,
+            fr_weight,
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
             v_alpha_sum_until_points.contiguous()
             if compute_alpha_sum_until_points
             else torch.zeros_like(v_render_alphas),
+            v_fr_depth.contiguous() if v_fr_depth is not None else None,
             absgrad,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
