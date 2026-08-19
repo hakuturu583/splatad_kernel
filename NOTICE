@@ -16,6 +16,20 @@ This repository contains a MODIFIED subset of that work. Changes made:
     compression, distributed helpers and profiling utilities were removed; what
     remains is the spherical LiDAR projection, tile binning and point
     rasterization plus the code they need.
+  * Rebased onto gsplat 1.5.3 for everything that is not LiDAR-specific. The
+    device math the two paths share -- quat_to_rotmat, quat_scale_to_covar_preci,
+    posW2C, covarW2C, add_blur, inverse_vjp, the glm warpSum overloads, the
+    CHECK_*/DEVICE_GUARD/CUB_WRAPPER macros and the glm typedefs -- is now
+    #included from the installed gsplat's headers (Utils.cuh, Common.h) instead
+    of being carried as a fork of gsplat 1.0.0. Only SplatAD's own spherical
+    math is kept: lidar_proj, depth_compensation_from_cov3d, vel_world_to_cam,
+    angle_difference, the 2x2 inverse gsplat 1.5.3 no longer has, and the
+    float2/float3 warpSum overloads it never had.
+    One behavioural note: gsplat 1.5.3 floors the antialiasing compensation at
+    MIN_COMPENSATION^2 where 1.0.0 floored it at zero. That value is only
+    computed when calc_compensations is requested, which the LiDAR path does not
+    do, so outputs are unchanged -- verified bit-exact on a 5-sensor rig over
+    six frames.
   * Python package renamed  gsplat -> splatad_kernel, and the CUDA extension
     renamed  gsplat_cuda -> splatad_kernel_cuda, so this can be installed
     alongside an ordinary gsplat without either colliding.
@@ -27,7 +41,9 @@ This repository contains a MODIFIED subset of that work. Changes made:
   * Rolling shutter reached through the existing per-column sweep-time input.
 
 --------------------------------------------------------------------------------
-OpenGL Mathematics (GLM)  (https://github.com/g-truc/glm)
-Vendored, headers only, under src/splatad_kernel/cuda/csrc/third_party/glm.
-Licensed under the MIT License / The Happy Bunny License -- see that directory's
-copying.txt for the full terms.
+gsplat  (https://github.com/nerfstudio-project/gsplat)
+Licensed under the Apache License, Version 2.0.
+
+Not vendored: the CUDA sources here #include gsplat's own headers out of the
+installed package. gsplat also supplies the OpenGL Mathematics (GLM) headers
+(MIT / The Happy Bunny License) that this kernel compiles against.

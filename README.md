@@ -53,7 +53,10 @@ displaced by its own scan time.
 
 The extension is JIT-compiled by `torch.utils.cpp_extension` on first import, so
 a CUDA toolkit (`nvcc`) must be on `PATH` and `TORCH_CUDA_ARCH_LIST` should name
-your architectures. GLM is vendored (headers only) — nothing else to install.
+your architectures. Nothing else to install: the shared device math and the GLM
+headers are read out of the installed `gsplat` (known good against 1.5.3), which
+you need for the camera path anyway. Only SplatAD's own spherical LiDAR math
+lives here.
 
 ```bash
 export TORCH_CUDA_ARCH_LIST="8.6"     # your GPU(s)

@@ -76,6 +76,29 @@ def cuda_toolkit_version():
     return cuda_version
 
 
+def gsplat_include_paths():
+    """Header directories borrowed from the installed gsplat.
+
+    The shared device math (``Utils.cuh``) and the glm headers both ship inside
+    the gsplat package, so this kernel compiles against gsplat's copies instead
+    of vendoring its own. gsplat is a hard dependency, and its headers sit next
+    to its Python sources in every install layout we support.
+    """
+    import gsplat
+
+    root = os.path.dirname(os.path.abspath(gsplat.__file__))
+    include = os.path.join(root, "cuda", "include")
+    glm = os.path.join(root, "cuda", "csrc", "third_party", "glm")
+    for path in (include, glm):
+        if not os.path.isdir(path):
+            raise RuntimeError(
+                f"gsplat is installed at {root} but {path} is missing; "
+                "splatad_kernel compiles against gsplat's CUDA headers and "
+                "needs an install that ships them."
+            )
+    return [include, glm]
+
+
 _C = None
 
 try:
@@ -86,10 +109,7 @@ except ImportError:
     if cuda_toolkit_available():
         name = "splatad_kernel_cuda"
         build_dir = _get_build_directory(name, verbose=False)
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        glm_path = os.path.join(current_dir, "csrc", "third_party", "glm")
-
-        extra_include_paths = [os.path.join(PATH, "csrc/"), glm_path]
+        extra_include_paths = [os.path.join(PATH, "csrc/")] + gsplat_include_paths()
         extra_cflags = ["-O3"]
         if NO_FAST_MATH:
             extra_cuda_cflags = ["-O3"]
@@ -112,9 +132,9 @@ except ImportError:
         except OSError:
             pass
 
-        if os.path.exists(os.path.join(build_dir, "splatad_kernel_cuda.so")) or os.path.exists(
-            os.path.join(build_dir, "splatad_kernel_cuda.lib")
-        ):
+        if os.path.exists(
+            os.path.join(build_dir, "splatad_kernel_cuda.so")
+        ) or os.path.exists(os.path.join(build_dir, "splatad_kernel_cuda.lib")):
             # If the build exists, we assume the extension has been built
             # and we can load it.
             _C = load_extension(

@@ -1,12 +1,14 @@
-#ifndef GSPLAT_CUDA_HELPERS_H
-#define GSPLAT_CUDA_HELPERS_H
+#ifndef SPLATAD_CUDA_HELPERS_H
+#define SPLATAD_CUDA_HELPERS_H
 
-#include "third_party/glm/glm/glm.hpp"
-#include "third_party/glm/glm/gtc/type_ptr.hpp"
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+// gsplat 1.5.3 supplies the glm typedefs and the warpSum overloads for the glm
+// vector/matrix types, so only the float2/float3 overloads it does not have and
+// SplatAD's own LiDAR velocity helpers live here. See NOTICE.
+#include "Utils.cuh"
 
 #include <ATen/cuda/Atomic.cuh>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 
 #define PRAGMA_UNROLL _Pragma("unroll")
 
@@ -14,13 +16,7 @@
 
 namespace cg = cooperative_groups;
 
-template <uint32_t DIM, class T, class WarpT>
-inline __device__ void warpSum(T *val, WarpT &warp) {
-    PRAGMA_UNROLL
-    for (uint32_t i = 0; i < DIM; i++) {
-        val[i] = cg::reduce(warp, val[i], cg::plus<T>());
-    }
-}
+using namespace gsplat;
 
 template <class WarpT> inline __device__ void warpSum(float3 &val, WarpT &warp) {
     val.x = cg::reduce(warp, val.x, cg::plus<float>());
@@ -31,90 +27,6 @@ template <class WarpT> inline __device__ void warpSum(float3 &val, WarpT &warp) 
 template <class WarpT> inline __device__ void warpSum(float2 &val, WarpT &warp) {
     val.x = cg::reduce(warp, val.x, cg::plus<float>());
     val.y = cg::reduce(warp, val.y, cg::plus<float>());
-}
-
-template <class WarpT> inline __device__ void warpSum(float &val, WarpT &warp) {
-    val = cg::reduce(warp, val, cg::plus<float>());
-}
-
-template <class WarpT> inline __device__ void warpSum(glm::vec4 &val, WarpT &warp) {
-    val.x = cg::reduce(warp, val.x, cg::plus<float>());
-    val.y = cg::reduce(warp, val.y, cg::plus<float>());
-    val.z = cg::reduce(warp, val.z, cg::plus<float>());
-    val.w = cg::reduce(warp, val.w, cg::plus<float>());
-}
-
-template <class WarpT> inline __device__ void warpSum(glm::vec3 &val, WarpT &warp) {
-    val.x = cg::reduce(warp, val.x, cg::plus<float>());
-    val.y = cg::reduce(warp, val.y, cg::plus<float>());
-    val.z = cg::reduce(warp, val.z, cg::plus<float>());
-}
-
-template <class WarpT> inline __device__ void warpSum(glm::vec2 &val, WarpT &warp) {
-    val.x = cg::reduce(warp, val.x, cg::plus<float>());
-    val.y = cg::reduce(warp, val.y, cg::plus<float>());
-}
-
-template <class WarpT> inline __device__ void warpSum(glm::mat4 &val, WarpT &warp) {
-    warpSum(val[0], warp);
-    warpSum(val[1], warp);
-    warpSum(val[2], warp);
-    warpSum(val[3], warp);
-}
-
-template <class WarpT> inline __device__ void warpSum(glm::mat3 &val, WarpT &warp) {
-    warpSum(val[0], warp);
-    warpSum(val[1], warp);
-    warpSum(val[2], warp);
-}
-
-template <class WarpT> inline __device__ void warpSum(glm::mat2 &val, WarpT &warp) {
-    warpSum(val[0], warp);
-    warpSum(val[1], warp);
-}
-
-template <class WarpT> inline __device__ void warpMax(float &val, WarpT &warp) {
-    val = cg::reduce(warp, val, cg::greater<float>());
-}
-
-inline __device__ void compute_pix_velocity(
-    const glm::vec3 p_view,
-    const glm::vec3 lin_vel,
-    const glm::vec3 ang_vel,
-    const glm::vec3 vel_view,
-    const float fx,
-    const float fy,
-    const float cx,
-    const float cy,
-    const uint32_t width,
-    const uint32_t height,
-    glm::vec2 &total_vel_pix
-) {
-
-    float x = p_view[0], y = p_view[1], z = p_view[2];
-
-    float tan_fovx = 0.5f * width / fx;
-    float tan_fovy = 0.5f * height / fy;
-    float lim_x_pos = (width - cx) / fx + 0.3f * tan_fovx;
-    float lim_x_neg = cx / fx + 0.3f * tan_fovx;
-    float lim_y_pos = (height - cy) / fy + 0.3f * tan_fovy;
-    float lim_y_neg = cy / fy + 0.3f * tan_fovy;
-
-    float rz = 1.f / z;
-    float rz2 = rz * rz;
-    float tx = z * min(lim_x_pos, max(-lim_x_neg, x * rz));
-    float ty = z * min(lim_y_pos, max(-lim_y_neg, y * rz));
-
-    // mat3x2 is 3 columns x 2 rows.
-    glm::mat3x2 J = glm::mat3x2(fx * rz, 0.f,                  // 1st column
-                                0.f, fy * rz,                  // 2nd column
-                                -fx * tx * rz2, -fy * ty * rz2 // 3rd column
-    );
-
-    glm::vec3 rot_part = glm::cross(ang_vel, p_view);
-    glm::vec3 total_vel = lin_vel + rot_part - vel_view;
-    // negative sign: move points to the opposite direction as the camera
-    total_vel_pix = -J * total_vel;
 }
 
 inline __device__ void compute_lidar_velocity(
@@ -152,79 +64,6 @@ inline __device__ void compute_lidar_velocity(
     total_vel_pix = -J * total_vel;
 }
 
-inline __device__ void compute_and_sum_pix_velocity_vjp(
-    const glm::vec3 p_view,
-    const glm::vec3 lin_vel,
-    const glm::vec3 ang_vel,
-    const glm::vec3 vel_view,
-    const float fx,
-    const float fy,
-    const float cx,
-    const float cy,
-    const uint32_t width,
-    const uint32_t height,
-    const glm::vec2 v_pix_velocity,
-    glm::vec3 &v_p_view_accumulator,
-    glm::vec3 &v_vel_view)
-{
-    float x = p_view[0], y = p_view[1], z = p_view[2];
-
-    float tan_fovx = 0.5f * width / fx;
-    float tan_fovy = 0.5f * height / fy;
-    float lim_x_pos = (width - cx) / fx + 0.3f * tan_fovx;
-    float lim_x_neg = cx / fx + 0.3f * tan_fovx;
-    float lim_y_pos = (height - cy) / fy + 0.3f * tan_fovy;
-    float lim_y_neg = cy / fy + 0.3f * tan_fovy;
-
-    float rz = 1.f / z;
-    float rz2 = rz * rz;
-    float tx = z * min(lim_x_pos, max(-lim_x_neg, x * rz));
-    float ty = z * min(lim_y_pos, max(-lim_y_neg, y * rz));
-
-    // mat3x2 is 3 columns x 2 rows.
-    glm::mat3x2 J = glm::mat3x2(fx * rz, 0.f,                  // 1st column
-                                0.f, fy * rz,                  // 2nd column
-                                -fx * tx * rz2, -fy * ty * rz2 // 3rd column
-    );
-
-    glm::vec3 rot_part = glm::cross(ang_vel, p_view);
-    glm::vec3 total_vel = lin_vel + rot_part - vel_view;
-
-    glm::mat3x2 dJ_dz = glm::mat3x2(
-        -fx * rz2,
-        0.f,
-        0.f,
-        -fy * rz2,
-        2.f * fx * tx * rz2 * rz,
-        2.f * fy * ty * rz2 * rz
-    );
-
-    if (x * rz <= lim_x_pos && x * rz >= -lim_x_neg) {
-        v_p_view_accumulator.x += v_pix_velocity.x * fx * rz2 * total_vel.z; //-glm::dot(v_pix_velocity, dJ_dx * total_vel);
-    } else {
-        v_p_view_accumulator.z += v_pix_velocity.x * fx * rz2 * rz * tx * total_vel.z; //-glm::dot(v_pix_velocity, dJ_dx * rz * tx * total_vel);
-    }
-    if (y * rz <= lim_y_pos && y * rz >= -lim_y_neg) {
-        v_p_view_accumulator.y += v_pix_velocity.y * fy * rz2 * total_vel.z; //glm::dot(v_pix_velocity, dJ_dy * total_vel);
-    } else {
-        v_p_view_accumulator.z += v_pix_velocity.y * fy * rz2 * rz * ty * total_vel.z; // glm::dot(v_pix_velocity, dJ_dy * rz * ty * total_vel);
-    }
-    v_p_view_accumulator.z -= glm::dot(v_pix_velocity, dJ_dz * total_vel);
-
-    glm::vec3 v_rot_part = -glm::transpose(J) * v_pix_velocity; // = v_total_vel
-
-    // (v_rot_part^T * cross_prod_matrix(ang_vel))^T
-    // = cross_prod_matrix(ang_vel)^T * v_rot_part // ... skew-symmetry
-    // = -cross_prod_matrix(ang_vel) * v_rot_part
-    // = -cross(ang_vel, v_rot_part)
-    glm::vec3 v_p_view_rot = -glm::cross(ang_vel, v_rot_part);
-
-    v_p_view_accumulator.x += v_p_view_rot[0];
-    v_p_view_accumulator.y += v_p_view_rot[1];
-    v_p_view_accumulator.z += v_p_view_rot[2];
-
-    v_vel_view -= v_rot_part;
-}
 
 inline __device__ void compute_and_sum_lidar_velocity_vjp(
     const glm::vec3 p_view,
@@ -308,4 +147,5 @@ inline __device__ void compute_and_sum_lidar_velocity_vjp(
     v_vel_view -= v_rot_part;
 }
 
-#endif // GSPLAT_CUDA_HELPERS_H
+
+#endif // SPLATAD_CUDA_HELPERS_H

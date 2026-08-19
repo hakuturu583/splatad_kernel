@@ -21,8 +21,13 @@ dependencies = [
     "typing_extensions",
     # ninja drives the JIT compile.
     "ninja",
-    "numpy",
-    "jaxtyping",
+    # The kernel compiles against gsplat's CUDA headers rather than vendoring
+    # its own copies: the shared device math (Utils.cuh, Common.h) and the glm
+    # headers both ship inside the gsplat package. Only SplatAD's own spherical
+    # LiDAR math is kept here. No version pin: the consumer chooses the gsplat
+    # it wants, and it needs one anyway for the camera path. Known good against
+    # gsplat 1.5.3.
+    "gsplat",
 ]
 
 [project.urls]
@@ -36,15 +41,15 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# The CUDA sources and the vendored GLM headers must ship with the package:
-# the extension is compiled from them on the machine that imports it.
+# The CUDA sources must ship with the package: the extension is compiled from
+# them on the machine that imports it. The glm and gsplat headers do not -- they
+# are read out of the installed gsplat (see cuda/_backend.gsplat_include_paths).
 [tool.setuptools.package-data]
 splatad_kernel = [
     "cuda/csrc/*.cu",
     "cuda/csrc/*.cuh",
     "cuda/csrc/*.cpp",
     "cuda/csrc/*.h",
-    "cuda/csrc/third_party/glm/**/*",
 ]
 
 [tool.ruff]
