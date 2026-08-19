@@ -290,7 +290,7 @@ def rasterize_to_points(
     packed: bool = False,
     absgrad: bool = False,
     static_render: bool = False,
-) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor]:
+) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor, Tensor]:
     """Rasterizes Gaussians to points.
 
     Args:
@@ -406,7 +406,13 @@ def rasterize_to_points(
         4,
     ), "raster_pts does not have the correct shape"
 
-    render_lidar_features, render_alphas, alpha_sum_until_points, median_depths = (
+    (
+        render_lidar_features,
+        render_alphas,
+        alpha_sum_until_points,
+        median_depths,
+        fr_depth,
+    ) = (
         _RasterizeToPoints.apply(
             means2d.contiguous(),
             conics.contiguous(),
@@ -432,7 +438,13 @@ def rasterize_to_points(
 
     if padded_channels > 0:
         render_lidar_features = render_lidar_features[..., :-padded_channels]
-    return render_lidar_features, render_alphas, alpha_sum_until_points, median_depths
+    return (
+        render_lidar_features,
+        render_alphas,
+        alpha_sum_until_points,
+        median_depths,
+        fr_depth,
+    )
 
 
 class _FullyFusedLidarProjection(torch.autograd.Function):
@@ -639,6 +651,8 @@ class _RasterizeToPoints(torch.autograd.Function):
             last_ids,
             alpha_sum_until_points,
             median_depths,
+            fr_depth,
+            fr_weight,
         ) = _make_lazy_cuda_func("rasterize_to_points_fwd")(
             means2d,
             conics,
@@ -673,6 +687,8 @@ class _RasterizeToPoints(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
+            fr_depth,
+            fr_weight,
         )
         ctx.width = width
         ctx.height = height
@@ -690,7 +706,10 @@ class _RasterizeToPoints(torch.autograd.Function):
         alpha_sum_until_points = (
             alpha_sum_until_points.float() if compute_alpha_sum_until_points else None
         )
-        return render_colors, render_alphas, alpha_sum_until_points, median_depths
+        # fr_depth (soft-first-return) is FORWARD-ONLY for now (prototype): non-diff until
+        # the backward (v_fr_depth) lands. fr_weight is internal (saved for that backward).
+        ctx.mark_non_differentiable(fr_depth)
+        return render_colors, render_alphas, alpha_sum_until_points, median_depths, fr_depth
 
     @staticmethod
     def backward(
@@ -699,6 +718,7 @@ class _RasterizeToPoints(torch.autograd.Function):
         v_render_alphas: Tensor,  # [C, H, W, 1]
         v_alpha_sum_until_points: Tensor,  # [C, H, W, 1]
         v_median_depths: Tensor,  # [C, H, W, 1]
+        v_fr_depth: Tensor,  # [C, H, W, 1] (forward-only prototype; ignored until backward lands)
     ):
         (
             means2d,
@@ -713,6 +733,8 @@ class _RasterizeToPoints(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
+            fr_depth,
+            fr_weight,
         ) = ctx.saved_tensors
         width = ctx.width
         height = ctx.height

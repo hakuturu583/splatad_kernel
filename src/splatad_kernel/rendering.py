@@ -333,7 +333,8 @@ def lidar_rasterization(
     if (lidar_features.shape[-1] + 1) > channel_chunk:
         # slice into chunks
         n_chunks = (lidar_features.shape[-1] + channel_chunk) // channel_chunk
-        render_lidar_features, render_alphas, alpha_sum_until_points, median_depths = (
+        render_lidar_features, render_alphas, alpha_sum_until_points, median_depths, fr_depth = (
+            [],
             [],
             [],
             [],
@@ -349,6 +350,7 @@ def lidar_rasterization(
                 render_alphas_,
                 alpha_sum_until_points_,
                 median_depths_,
+                fr_depth_,
             ) = rasterize_to_points(
                 means2d,
                 conics,
@@ -376,12 +378,14 @@ def lidar_rasterization(
             render_alphas.append(render_alphas_)
             alpha_sum_until_points.append(alpha_sum_until_points_)
             median_depths.append(median_depths_)
+            fr_depth.append(fr_depth_)
         render_lidar_features = torch.cat(render_lidar_features, dim=-1)
         median_depths = torch.cat(median_depths, dim=-1)
+        fr_depth = torch.cat(fr_depth, dim=-1)
         render_alphas = render_alphas[0]  # discard the rest
         alpha_sum_until_points = alpha_sum_until_points[0]  # same alphas for all chunks
     else:
-        render_lidar_features, render_alphas, alpha_sum_until_points, median_depths = (
+        render_lidar_features, render_alphas, alpha_sum_until_points, median_depths, fr_depth = (
             rasterize_to_points(
                 means2d,
                 conics,
@@ -425,5 +429,6 @@ def lidar_rasterization(
         "tile_height": tile_height,
         "n_cameras": C,
         "median_depths": median_depths,
+        "fr_depth": fr_depth,
     }
     return render_lidar_features, render_alphas, alpha_sum_until_points, meta

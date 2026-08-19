@@ -467,7 +467,9 @@ __global__ void rasterize_to_points_fwd_kernel(
     float *__restrict__ render_alphas,             // [C, image_height, image_width, 1]
     float *__restrict__ alpha_sum_until_points,    // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids,                 // [C, image_height, image_width]
-    float *__restrict__ median_depths    // [C, image_height, image_width, 1]
+    float *__restrict__ median_depths,   // [C, image_height, image_width, 1]
+    float *__restrict__ fr_depth,        // [C, image_height, image_width, 1]  (DIFFERENTIABLE soft-first-return: alpha-weighted expected range over the FIRST-surface prefix T_i>0.5. D=Σ_{T>0.5} vis·rng / Σ_{T>0.5} vis; -> hard median as the first surface sharpens. Grads means/opacity/scale via the backward.)
+    float *__restrict__ fr_weight        // [C, image_height, image_width, 1]  (Σ_{T>0.5} vis — the fr denominator, saved for the fr backward normalization.)
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -483,6 +485,8 @@ __global__ void rasterize_to_points_fwd_kernel(
     render_colors += camera_offset * COLOR_DIM;
     render_alphas += camera_offset;
     median_depths += camera_offset;
+    if (fr_depth != nullptr) { fr_depth += camera_offset; }
+    if (fr_weight != nullptr) { fr_weight += camera_offset; }
     if (compute_alpha_sum_until_points && (alpha_sum_until_points != nullptr)) {
         alpha_sum_until_points += camera_offset;
     }
@@ -567,6 +571,7 @@ __global__ void rasterize_to_points_fwd_kernel(
     uint32_t tr = block.thread_rank();
 
     float pix_out[COLOR_DIM] = {0.f};
+    float fr_num = 0.f, fr_den = 0.f;  // soft-first-return: Σ_{T>0.5} vis·rng and Σ_{T>0.5} vis
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before beginning next batch
         // end early if entire tile is done
@@ -667,6 +672,9 @@ __global__ void rasterize_to_points_fwd_kernel(
                     for (uint32_t kk = 0; kk < COLOR_DIM; ++kk) {
                         pix_out[kk] += c_row[kk] * vis_row;
                     }
+                    // soft-first-return: accumulate over the first-surface prefix (T>0.5). STATIC
+                    // path has no depth tilt, so range == c_row[depth_channel_idx].
+                    if (T > 0.5f) { fr_num += c_row[depth_channel_idx] * vis_row; fr_den += vis_row; }
                     if (T > 0.5f && next_T_row <= 0.5f) {
                         median_depths[pix_id] = c_row[depth_channel_idx];
                     }
@@ -738,6 +746,8 @@ __global__ void rasterize_to_points_fwd_kernel(
                 pix_out[k] += c_ptr[k] * vis;
             }
             pix_out[depth_channel_idx] += depth_extra * vis;
+            // soft-first-return prefix accumulation (general path: range includes depth tilt).
+            if (T > 0.5f) { fr_num += (c_ptr[depth_channel_idx] + depth_extra) * vis; fr_den += vis; }
             if (T > 0.5 && next_T <= 0.5) {
                 // median depth of the gaussian
                 median_depths[pix_id] = c_ptr[depth_channel_idx] + depth_extra;
@@ -763,6 +773,8 @@ __global__ void rasterize_to_points_fwd_kernel(
         // However, double precision makes the backward pass 1.5x slower so we stick
         // with float for now.
         render_alphas[pix_id] = 1.0f - T;
+        if (fr_depth != nullptr) { fr_depth[pix_id] = (fr_den > 1e-6f) ? (fr_num / fr_den) : 0.f; }
+        if (fr_weight != nullptr) { fr_weight[pix_id] = fr_den; }
         PRAGMA_UNROLL
         for (uint32_t k = 0; k < COLOR_DIM; ++k) {
             render_colors[pix_id * COLOR_DIM + k] =
@@ -773,7 +785,7 @@ __global__ void rasterize_to_points_fwd_kernel(
     }
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_points_fwd_tensor(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_points_fwd_tensor(
     // Gaussian parameters
     const torch::Tensor &means2d,                   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,                    // [C, N, 3] or [nnz, 3]
@@ -834,6 +846,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                                         means2d.options().dtype(torch::kFloat32));
     torch::Tensor median_depths = torch::zeros({C, image_height, image_width, 1},
                                         means2d.options().dtype(torch::kFloat32));
+    torch::Tensor fr_depth = torch::zeros({C, image_height, image_width, 1},
+                                          means2d.options().dtype(torch::kFloat32));
+    torch::Tensor fr_weight = torch::zeros({C, image_height, image_width, 1},
+                                           means2d.options().dtype(torch::kFloat32));
     torch::Tensor alpha_sum_until_points;
     if (compute_alpha_sum_until_points) {
         alpha_sum_until_points = torch::zeros({C, image_height, image_width, 1},
@@ -889,7 +905,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 2:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<2, false>,
@@ -917,7 +933,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 3:
         // splatsim: dispatch the static (no rolling-shutter / no depth-comp)
@@ -958,7 +974,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 renders.data_ptr<float>(),
                 alphas.data_ptr<float>(),
                 compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
             } else {
                 rasterize_to_points_fwd_kernel<3, true, false>
                     <<<blocks, threads, shared_mem_static, stream>>>(
@@ -980,7 +996,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 renders.data_ptr<float>(),
                 alphas.data_ptr<float>(),
                 compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
             }
         } else {
             auto kern_v = needs_depth_comp
@@ -1013,7 +1029,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 renders.data_ptr<float>(),
                 alphas.data_ptr<float>(),
                 compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
             } else {
             rasterize_to_points_fwd_kernel<3, false, false, false>
                 <<<blocks, threads, shared_mem, stream>>>(
@@ -1035,7 +1051,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 renders.data_ptr<float>(),
                 alphas.data_ptr<float>(),
                 compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
             }
         }
         break;
@@ -1065,7 +1081,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 5:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<5, false>,
@@ -1093,7 +1109,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 8:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<8, false>,
@@ -1121,7 +1137,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 9:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<9, false>,
@@ -1149,7 +1165,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 16:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<16, false>,
@@ -1177,7 +1193,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 17:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<17, false>,
@@ -1205,7 +1221,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 32:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<32, false>,
@@ -1233,7 +1249,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 33:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<33, false>,
@@ -1261,7 +1277,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 64:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<64, false>,
@@ -1289,7 +1305,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 65:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<65, false>,
@@ -1317,7 +1333,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 128:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<128, false>,
@@ -1345,7 +1361,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 129:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<129, false>,
@@ -1373,7 +1389,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 256:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<256, false>,
@@ -1401,7 +1417,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 257:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<257, false>,
@@ -1429,7 +1445,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 512:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<512, false>,
@@ -1457,7 +1473,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     case 513:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<513, false>,
@@ -1485,12 +1501,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>());
         break;
     default:
         AT_ERROR("Unsupported number of channels: ", channels);
     }
-    return std::make_tuple(renders, alphas, last_ids, alpha_sum_until_points, median_depths);
+    return std::make_tuple(renders, alphas, last_ids, alpha_sum_until_points, median_depths, fr_depth, fr_weight);
 }
 
 template <uint32_t COLOR_DIM>
