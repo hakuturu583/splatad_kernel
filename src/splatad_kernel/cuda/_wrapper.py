@@ -303,6 +303,7 @@ def rasterize_to_points(
     static_render: bool = False,
     tile_col_offset: int = 0,
     use_depth_comp: bool = True,
+    depth_lanes: bool = False,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor]:
     """Rasterizes Gaussians to points.
 
@@ -329,6 +330,15 @@ def rasterize_to_points(
             image covers. The tile grid (isect_offsets) always spans the full
             azimuth ring; a sector image rasterizes only its own tile columns,
             looked up at this offset. Forward-only (backward requires 0). Default: 0.
+        depth_lanes: splatsim — give each pixel 16 threads along the DEPTH axis
+            (associative alpha-blend composition; thresholds resolved by
+            re-walking the crossing lane). Lifts rasterization parallelism from
+            #pixels to 16x #pixels, which is what makes small azimuth-sector
+            images fast on big GPUs. Output differs from the serial kernel at
+            float-epsilon level (deterministic). Only lidar_features with 3
+            channels and compute_alpha_sum_until_points=False take this path;
+            anything else silently falls back to the serial kernel.
+            Forward/inference only (backward refuses). Default: False.
 
     Returns:
         A tuple:
@@ -438,6 +448,7 @@ def rasterize_to_points(
             tile_width,
             tile_height,
             tile_col_offset,
+            depth_lanes,
             isect_offsets.contiguous(),
             flatten_ids.contiguous(),
             compute_alpha_sum_until_points,
@@ -648,6 +659,7 @@ class _RasterizeToPoints(torch.autograd.Function):
         tile_width: int,
         tile_height: int,
         tile_col_offset: int,
+        depth_lanes: bool,
         isect_offsets: Tensor,  # [C, tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
         compute_alpha_sum_until_points: bool,
@@ -677,6 +689,7 @@ class _RasterizeToPoints(torch.autograd.Function):
             tile_width,
             tile_height,
             tile_col_offset,
+            depth_lanes,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             isect_offsets,
@@ -705,6 +718,7 @@ class _RasterizeToPoints(torch.autograd.Function):
         ctx.tile_width = tile_width
         ctx.tile_height = tile_height
         ctx.tile_col_offset = tile_col_offset
+        ctx.depth_lanes = depth_lanes
         ctx.absgrad = absgrad
         ctx.compute_alpha_sum_until_points = compute_alpha_sum_until_points
         ctx.compute_alpha_sum_until_points_threshold = (
@@ -750,6 +764,12 @@ class _RasterizeToPoints(torch.autograd.Function):
             # inference-time feature (splatsim streams sectors under no_grad).
             raise NotImplementedError(
                 "rasterize_to_points backward does not support tile_col_offset != 0"
+            )
+        if ctx.depth_lanes:
+            # The backward kernel re-walks the blend serially and would see the
+            # lane composition's float-epsilon drift; lanes are inference-only.
+            raise NotImplementedError(
+                "rasterize_to_points backward does not support depth_lanes"
             )
         absgrad = ctx.absgrad
         compute_alpha_sum_until_points = ctx.compute_alpha_sum_until_points
@@ -817,6 +837,7 @@ class _RasterizeToPoints(torch.autograd.Function):
             None,
             None,
             None,  # tile_col_offset
+            None,  # depth_lanes
             None,
             None,
             None,
