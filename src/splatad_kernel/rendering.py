@@ -44,6 +44,7 @@ def lidar_rasterization(
     packed: bool = False,  # packed mode is not supported yet
     sparse_grad: bool = False,
     absgrad: bool = False,
+    tile_col_offset: int = 0,  # sector rendering, see rasterize_to_points
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
     channel_chunk: int = 32,
     use_depth_compensation: bool = True,
@@ -368,6 +369,7 @@ def lidar_rasterization(
                 packed=packed,
                 absgrad=absgrad,
                 static_render=static_render,
+                tile_col_offset=tile_col_offset,
             )
             if i == (n_chunks - 1):
                 render_lidar_features.append(render_lidar_features_)
@@ -401,6 +403,7 @@ def lidar_rasterization(
                 packed=packed,
                 absgrad=absgrad,
                 static_render=static_render,
+                tile_col_offset=tile_col_offset,
             )
         )
 

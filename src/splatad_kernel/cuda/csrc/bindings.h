@@ -93,6 +93,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // image size
     const uint32_t image_width, const uint32_t image_height,
     const uint32_t tile_width, const uint32_t tile_height,
+    // splatsim sector rendering: first tile-grid column this image covers
+    const uint32_t tile_col_offset,
     // compute alphas until point
     const bool compute_alpha_sum_until_points,
     const float compute_alpha_sum_until_points_threshold,

@@ -458,6 +458,11 @@ __global__ void rasterize_to_points_fwd_kernel(
     const uint32_t tile_height,
     const uint32_t tile_grid_width,
     const uint32_t tile_grid_height,
+    // splatsim sector rendering: the image may be an azimuth SLICE of the tile
+    // grid (which always covers the full ring, so binning matches a full-frame
+    // render bit for bit). Block column gz draws image columns
+    // [gz*tile_width, ...) but reads tile (gz + tile_col_offset) of the grid.
+    const uint32_t tile_col_offset,
     const bool compute_alpha_sum_until_points,
     const float compute_alpha_sum_until_points_threshold,
     const int32_t *__restrict__ tile_offsets,      // [C, tile_grid_height, tile_grid_width]
@@ -474,7 +479,8 @@ __global__ void rasterize_to_points_fwd_kernel(
 
     auto block = cg::this_thread_block();
     int32_t camera_id = block.group_index().x;
-    int32_t tile_id = block.group_index().y * tile_grid_width + block.group_index().z;
+    int32_t tile_id =
+        block.group_index().y * tile_grid_width + block.group_index().z + tile_col_offset;
     uint32_t i = block.group_index().y * tile_height + block.thread_index().y;
     uint32_t j = block.group_index().z * tile_width + block.thread_index().x;
 
@@ -789,6 +795,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    // splatsim sector rendering: first tile-grid column this image covers
+    const uint32_t tile_col_offset,
     // compute alphas until point
     const bool compute_alpha_sum_until_points,
     const float compute_alpha_sum_until_points_threshold,
@@ -823,10 +831,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     uint32_t tile_grid_width = tile_offsets.size(2);
     uint32_t n_isects = flatten_ids.size(0);
 
-    // Each block covers a tile on the image. In total there are
-    // C * tile_grid_height * tile_grid_width blocks.
+    // Each block covers a tile on the image. The tile grid may cover a wider
+    // azimuth ring than the image (sector rendering): launch only the image's
+    // own tile columns; the kernel offsets its grid lookup by tile_col_offset.
+    const uint32_t n_pix_tiles_x = (image_width + tile_width - 1) / tile_width;
+    TORCH_CHECK(tile_col_offset + n_pix_tiles_x <= tile_grid_width,
+                "tile_col_offset (", tile_col_offset, ") + image tile columns (",
+                n_pix_tiles_x, ") exceeds the tile grid width (", tile_grid_width, ")");
     dim3 threads = {tile_width, tile_height, 1};
-    dim3 blocks = {C, tile_grid_height, tile_grid_width};
+    dim3 blocks = {C, tile_grid_height, n_pix_tiles_x};
 
     torch::Tensor renders = torch::zeros({C, image_height, image_width, channels},
                                          means2d.options().dtype(torch::kFloat32));
@@ -880,7 +893,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -908,7 +921,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -949,7 +962,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 (float2 *)depth_compensations.data_ptr<float>(),
                 backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
                 (float4 *)raster_pts.data_ptr<float>(),
-                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
                 compute_alpha_sum_until_points,
                 compute_alpha_sum_until_points_threshold,
                 tile_offsets.data_ptr<int32_t>(),
@@ -971,7 +984,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 (float2 *)depth_compensations.data_ptr<float>(),
                 backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
                 (float4 *)raster_pts.data_ptr<float>(),
-                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
                 compute_alpha_sum_until_points,
                 compute_alpha_sum_until_points_threshold,
                 tile_offsets.data_ptr<int32_t>(),
@@ -1004,7 +1017,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 (float2 *)depth_compensations.data_ptr<float>(),
                 backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
                 (float4 *)raster_pts.data_ptr<float>(),
-                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
                 compute_alpha_sum_until_points,
                 compute_alpha_sum_until_points_threshold,
                 tile_offsets.data_ptr<int32_t>(),
@@ -1026,7 +1039,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 (float2 *)depth_compensations.data_ptr<float>(),
                 backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
                 (float4 *)raster_pts.data_ptr<float>(),
-                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
                 compute_alpha_sum_until_points,
                 compute_alpha_sum_until_points_threshold,
                 tile_offsets.data_ptr<int32_t>(),
@@ -1056,7 +1069,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1084,7 +1097,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1112,7 +1125,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1140,7 +1153,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1168,7 +1181,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1196,7 +1209,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1224,7 +1237,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1252,7 +1265,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1280,7 +1293,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1308,7 +1321,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1336,7 +1349,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1364,7 +1377,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1392,7 +1405,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1420,7 +1433,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1448,7 +1461,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1476,7 +1489,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),

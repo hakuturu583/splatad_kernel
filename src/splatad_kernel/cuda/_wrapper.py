@@ -290,6 +290,7 @@ def rasterize_to_points(
     packed: bool = False,
     absgrad: bool = False,
     static_render: bool = False,
+    tile_col_offset: int = 0,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor]:
     """Rasterizes Gaussians to points.
 
@@ -312,6 +313,10 @@ def rasterize_to_points(
         backgrounds: Background colors. [C, channels]. Default: None.
         packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
         absgrad: If True, the backward pass will compute a `.absgrad` attribute for `means2d`. Default: False.
+        tile_col_offset: splatsim sector rendering — first tile-grid column the
+            image covers. The tile grid (isect_offsets) always spans the full
+            azimuth ring; a sector image rasterizes only its own tile columns,
+            looked up at this offset. Forward-only (backward requires 0). Default: 0.
 
     Returns:
         A tuple:
@@ -420,6 +425,7 @@ def rasterize_to_points(
             image_height,
             tile_width,
             tile_height,
+            tile_col_offset,
             isect_offsets.contiguous(),
             flatten_ids.contiguous(),
             compute_alpha_sum_until_points,
@@ -625,6 +631,7 @@ class _RasterizeToPoints(torch.autograd.Function):
         height: int,
         tile_width: int,
         tile_height: int,
+        tile_col_offset: int,
         isect_offsets: Tensor,  # [C, tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
         compute_alpha_sum_until_points: bool,
@@ -652,6 +659,7 @@ class _RasterizeToPoints(torch.autograd.Function):
             height,
             tile_width,
             tile_height,
+            tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             isect_offsets,
@@ -678,6 +686,7 @@ class _RasterizeToPoints(torch.autograd.Function):
         ctx.height = height
         ctx.tile_width = tile_width
         ctx.tile_height = tile_height
+        ctx.tile_col_offset = tile_col_offset
         ctx.absgrad = absgrad
         ctx.compute_alpha_sum_until_points = compute_alpha_sum_until_points
         ctx.compute_alpha_sum_until_points_threshold = (
@@ -718,6 +727,12 @@ class _RasterizeToPoints(torch.autograd.Function):
         height = ctx.height
         tile_width = ctx.tile_width
         tile_height = ctx.tile_height
+        if ctx.tile_col_offset != 0:
+            # The backward kernel has no sector support; sector rendering is an
+            # inference-time feature (splatsim streams sectors under no_grad).
+            raise NotImplementedError(
+                "rasterize_to_points backward does not support tile_col_offset != 0"
+            )
         absgrad = ctx.absgrad
         compute_alpha_sum_until_points = ctx.compute_alpha_sum_until_points
         compute_alpha_sum_until_points_threshold = (
@@ -783,6 +798,7 @@ class _RasterizeToPoints(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # tile_col_offset
             None,
             None,
             None,
