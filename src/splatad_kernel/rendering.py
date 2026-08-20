@@ -44,6 +44,9 @@ def lidar_rasterization(
     packed: bool = False,  # packed mode is not supported yet
     sparse_grad: bool = False,
     absgrad: bool = False,
+    tile_col_offset: int = 0,  # sector rendering, see rasterize_to_points
+    valid_mask: Optional[Tensor] = None,  # [N] bool, see fully_fused_lidar_projection
+    depth_lanes: bool = False,  # 16 depth lanes/pixel, see rasterize_to_points
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
     channel_chunk: int = 32,
     use_depth_compensation: bool = True,
@@ -254,6 +257,7 @@ def lidar_rasterization(
         linear_velocity,
         angular_velocity,
         rolling_shutter_time,
+        valid_mask=valid_mask,
         min_elevation=min_elevation,
         max_elevation=max_elevation,
         min_azimuth=min_azimuth,
@@ -368,6 +372,9 @@ def lidar_rasterization(
                 packed=packed,
                 absgrad=absgrad,
                 static_render=static_render,
+                tile_col_offset=tile_col_offset,
+                use_depth_comp=use_depth_compensation,
+                depth_lanes=depth_lanes,
             )
             if i == (n_chunks - 1):
                 render_lidar_features.append(render_lidar_features_)
@@ -401,6 +408,9 @@ def lidar_rasterization(
                 packed=packed,
                 absgrad=absgrad,
                 static_render=static_render,
+                tile_col_offset=tile_col_offset,
+                use_depth_comp=use_depth_compensation,
+                depth_lanes=depth_lanes,
             )
         )
 

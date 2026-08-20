@@ -24,6 +24,7 @@ def fully_fused_lidar_projection(
     linear_velocity: Tensor,  # [C, 3]
     angular_velocity: Tensor,  # [C, 3]
     rolling_shutter_time: Tensor,  # [C]
+    valid_mask: Optional[Tensor] = None,  # [N] bool
     min_elevation: float = -45,
     max_elevation: float = 45,
     min_azimuth: float = -180,
@@ -71,6 +72,11 @@ def fully_fused_lidar_projection(
         linear_velocity: Linear velocity of the Lidar. [C, 3]
         angular_velocity: Angular velocity of the Lidar. [C, 3]
         rolling_shutter_time: Rolling shutter time of the Lidar. [C]
+        valid_mask: Optional per-Gaussian keep mask (bool, [N]). Masked
+          Gaussians are treated exactly like frustum-culled ones (radii = 0)
+          without the caller having to compact the input arrays — the point is
+          sector streaming, where a host-side azimuth cull would otherwise pay
+          a nonzero()/index_select (and a device sync) per sector. Default: None.
         min_elevation: Minimum elevation angle in degrees. Default: -45.
         max_elevation: Maximum elevation angle in degrees. Default: 45.
         min_azimuth: Minimum azimuth angle in degrees. Default: -180.
@@ -128,6 +134,10 @@ def fully_fused_lidar_projection(
     if velocities is not None:
         assert velocities.size() == (N, 3), velocities.size()
         velocities = velocities.contiguous()
+    if valid_mask is not None:
+        assert valid_mask.shape == (N,), valid_mask.shape
+        assert valid_mask.dtype == torch.bool, valid_mask.dtype
+        valid_mask = valid_mask.contiguous()
     if sparse_grad:
         assert packed, "sparse_grad is only supported when packed is True"
 
@@ -143,6 +153,7 @@ def fully_fused_lidar_projection(
             quats,
             scales,
             velocities,
+            valid_mask,
             viewmats,
             min_elevation,
             max_elevation,
@@ -290,6 +301,9 @@ def rasterize_to_points(
     packed: bool = False,
     absgrad: bool = False,
     static_render: bool = False,
+    tile_col_offset: int = 0,
+    use_depth_comp: bool = True,
+    depth_lanes: bool = False,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor]:
     """Rasterizes Gaussians to points.
 
@@ -312,6 +326,19 @@ def rasterize_to_points(
         backgrounds: Background colors. [C, channels]. Default: None.
         packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
         absgrad: If True, the backward pass will compute a `.absgrad` attribute for `means2d`. Default: False.
+        tile_col_offset: splatsim sector rendering — first tile-grid column the
+            image covers. The tile grid (isect_offsets) always spans the full
+            azimuth ring; a sector image rasterizes only its own tile columns,
+            looked up at this offset. Forward-only (backward requires 0). Default: 0.
+        depth_lanes: splatsim — give each pixel 16 threads along the DEPTH axis
+            (associative alpha-blend composition; thresholds resolved by
+            re-walking the crossing lane). Lifts rasterization parallelism from
+            #pixels to 16x #pixels, which is what makes small azimuth-sector
+            images fast on big GPUs. Output differs from the serial kernel at
+            float-epsilon level (deterministic). Only lidar_features with 3
+            channels and compute_alpha_sum_until_points=False take this path;
+            anything else silently falls back to the serial kernel.
+            Forward/inference only (backward refuses). Default: False.
 
     Returns:
         A tuple:
@@ -420,6 +447,8 @@ def rasterize_to_points(
             image_height,
             tile_width,
             tile_height,
+            tile_col_offset,
+            depth_lanes,
             isect_offsets.contiguous(),
             flatten_ids.contiguous(),
             compute_alpha_sum_until_points,
@@ -427,6 +456,7 @@ def rasterize_to_points(
             absgrad,
             depth_channel_idx,
             static_render,
+            use_depth_comp,
         )
     )
 
@@ -446,6 +476,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
         quats: Tensor,  # [N, 4] or None
         scales: Tensor,  # [N, 3] or None
         velocities: Tensor,  # [N, 3] or None
+        valid_mask: Tensor,  # [N] bool or None
         viewmats: Tensor,  # [C, 4, 4]
         min_elevation: float,
         max_elevation: float,
@@ -468,6 +499,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
                 quats,
                 scales,
                 velocities,
+                valid_mask,
                 viewmats,
                 min_elevation,
                 max_elevation,
@@ -573,7 +605,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
             v_compensations,
             v_pix_vels.contiguous(),
             v_depth_compensations.contiguous(),
-            ctx.needs_input_grad[5],  # viewmats_requires_grad
+            ctx.needs_input_grad[6],  # viewmats_requires_grad
         )
         if not ctx.needs_input_grad[0]:
             v_means = None
@@ -583,7 +615,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
             v_quats = None
         if not ctx.needs_input_grad[3]:
             v_scales = None
-        if not ctx.needs_input_grad[5]:
+        if not ctx.needs_input_grad[6]:
             v_viewmats = None
         return (
             v_means,
@@ -591,6 +623,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
             v_quats,
             v_scales,
             None,
+            None,  # valid_mask
             v_viewmats,
             None,
             None,
@@ -625,6 +658,8 @@ class _RasterizeToPoints(torch.autograd.Function):
         height: int,
         tile_width: int,
         tile_height: int,
+        tile_col_offset: int,
+        depth_lanes: bool,
         isect_offsets: Tensor,  # [C, tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
         compute_alpha_sum_until_points: bool,
@@ -632,6 +667,7 @@ class _RasterizeToPoints(torch.autograd.Function):
         absgrad: bool,
         depth_channel_idx: int,
         static_render: bool = False,
+        use_depth_comp: bool = True,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
         (
             render_colors,
@@ -652,12 +688,15 @@ class _RasterizeToPoints(torch.autograd.Function):
             height,
             tile_width,
             tile_height,
+            tile_col_offset,
+            depth_lanes,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             isect_offsets,
             flatten_ids,
             depth_channel_idx,
             static_render,
+            use_depth_comp,
         )
 
         ctx.save_for_backward(
@@ -678,6 +717,8 @@ class _RasterizeToPoints(torch.autograd.Function):
         ctx.height = height
         ctx.tile_width = tile_width
         ctx.tile_height = tile_height
+        ctx.tile_col_offset = tile_col_offset
+        ctx.depth_lanes = depth_lanes
         ctx.absgrad = absgrad
         ctx.compute_alpha_sum_until_points = compute_alpha_sum_until_points
         ctx.compute_alpha_sum_until_points_threshold = (
@@ -718,6 +759,18 @@ class _RasterizeToPoints(torch.autograd.Function):
         height = ctx.height
         tile_width = ctx.tile_width
         tile_height = ctx.tile_height
+        if ctx.tile_col_offset != 0:
+            # The backward kernel has no sector support; sector rendering is an
+            # inference-time feature (splatsim streams sectors under no_grad).
+            raise NotImplementedError(
+                "rasterize_to_points backward does not support tile_col_offset != 0"
+            )
+        if ctx.depth_lanes:
+            # The backward kernel re-walks the blend serially and would see the
+            # lane composition's float-epsilon drift; lanes are inference-only.
+            raise NotImplementedError(
+                "rasterize_to_points backward does not support depth_lanes"
+            )
         absgrad = ctx.absgrad
         compute_alpha_sum_until_points = ctx.compute_alpha_sum_until_points
         compute_alpha_sum_until_points_threshold = (
@@ -783,7 +836,8 @@ class _RasterizeToPoints(torch.autograd.Function):
             None,
             None,
             None,
-            None,
+            None,  # tile_col_offset
+            None,  # depth_lanes
             None,
             None,
             None,
@@ -791,4 +845,5 @@ class _RasterizeToPoints(torch.autograd.Function):
             None,
             None,
             None,  # static_render
+            None,  # use_depth_comp
         )

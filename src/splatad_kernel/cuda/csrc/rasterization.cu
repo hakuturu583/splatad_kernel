@@ -458,6 +458,11 @@ __global__ void rasterize_to_points_fwd_kernel(
     const uint32_t tile_height,
     const uint32_t tile_grid_width,
     const uint32_t tile_grid_height,
+    // splatsim sector rendering: the image may be an azimuth SLICE of the tile
+    // grid (which always covers the full ring, so binning matches a full-frame
+    // render bit for bit). Block column gz draws image columns
+    // [gz*tile_width, ...) but reads tile (gz + tile_col_offset) of the grid.
+    const uint32_t tile_col_offset,
     const bool compute_alpha_sum_until_points,
     const float compute_alpha_sum_until_points_threshold,
     const int32_t *__restrict__ tile_offsets,      // [C, tile_grid_height, tile_grid_width]
@@ -474,7 +479,8 @@ __global__ void rasterize_to_points_fwd_kernel(
 
     auto block = cg::this_thread_block();
     int32_t camera_id = block.group_index().x;
-    int32_t tile_id = block.group_index().y * tile_grid_width + block.group_index().z;
+    int32_t tile_id =
+        block.group_index().y * tile_grid_width + block.group_index().z + tile_col_offset;
     uint32_t i = block.group_index().y * tile_height + block.thread_index().y;
     uint32_t j = block.group_index().z * tile_width + block.thread_index().x;
 
@@ -773,6 +779,358 @@ __global__ void rasterize_to_points_fwd_kernel(
     }
 }
 
+
+// ── splatsim: depth-parallel rasterization (sector streaming) ────────────
+//
+// The serial kernel above gives each pixel ONE thread that walks its tile's
+// depth-sorted Gaussian list front to back. Rasterization parallelism is
+// therefore capped at the pixel count — fine for a full panorama (100k+
+// pixels), hopeless for an azimuth SECTOR of one: a 450-column sector is
+// ~500 tiles x 16 threads = 14k threads on a GPU that wants 200k+, and the
+// dense road-facing tiles carry lists of up to ~100k Gaussians that one
+// half-warp then grinds through serially (~11 ms tails measured on sm_89).
+//
+// This variant gives each pixel LANES extra threads along the DEPTH axis.
+// Alpha blending composes associatively:
+//   (F1, T1) then (F2, T2)  ==  (F1 + T1*F2, T1*T2)
+// so each lane blends a contiguous slice of the staged batch into a partial
+// (F_r, T_r) with a fresh T=1, and one compose thread per pixel folds the
+// LANES partials in order, scaling each by the running transmittance prefix.
+// The two order-sensitive events — the median-depth crossing (T falls
+// through 0.5) and the early-out (T <= 1e-4, exclusive of the crossing
+// Gaussian) — are detected on the lane prefixes (T is monotone within a
+// lane) and resolved by re-walking JUST the crossing lane's slice with the
+// serial kernel's exact logic. Each pixel crosses each threshold at most
+// once per panorama, so re-walks are vanishingly rare.
+//
+// Numerics: scaling a lane partial (P * sum(a_i * prod)) rounds differently
+// from the serial running product, so lane output differs from the serial
+// kernel at float epsilon level. It is still deterministic: a sector render
+// and a full-frame render stage identical tile lists into identical slices,
+// so sector-vs-full stays bit-exact as long as both use the same kernel.
+//
+// Forward/inference only: last_ids is filled (last accepted index, as the
+// serial kernel), but the backward pass recomputes blending serially and
+// would see the epsilon drift, so the Python wrapper refuses to
+// differentiate through a depth_lanes forward.
+template <uint32_t COLOR_DIM, bool STATIC, bool ROW_TILE = false,
+          bool DEPTH_COMP = true, uint32_t LANES = 16, uint32_t BATCH_MULT_L = 2>
+__global__ void rasterize_to_points_fwd_lanes_kernel(
+    const uint32_t C, const uint32_t N, const uint32_t n_isects, const bool packed,
+    const float2 *__restrict__ means2d,             // [C, N, 2] or [nnz, 2]
+    const float3 *__restrict__ conics,              // [C, N, 3] or [nnz, 3]
+    const float *__restrict__ colors,               // [C, N, COLOR_DIM] or [nnz, COLOR_DIM]
+    const float *__restrict__ opacities,            // [C, N] or [nnz]
+    const float3 *__restrict__ pix_vels,            // [C, N, 3] or [nnz, 3]
+    const float2 *__restrict__ depth_compensations, // [C, N, 2] or [nnz, 2]
+    const float *__restrict__ backgrounds,          // [C, COLOR_DIM]
+    const float4 *__restrict__ raster_pts,          // [C, image_height, image_width, 4]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_width,
+    const uint32_t tile_height,
+    const uint32_t tile_grid_width,
+    const uint32_t tile_grid_height,
+    const uint32_t tile_col_offset,
+    const int32_t *__restrict__ tile_offsets,      // [C, tile_grid_height, tile_grid_width]
+    const int32_t *__restrict__ flatten_ids,       // [n_isects]
+    const uint32_t depth_channel_idx,
+    float *__restrict__ render_colors,             // [C, image_height, image_width, COLOR_DIM]
+    float *__restrict__ render_alphas,             // [C, image_height, image_width, 1]
+    int32_t *__restrict__ last_ids,                // [C, image_height, image_width]
+    float *__restrict__ median_depths              // [C, image_height, image_width, 1]
+) {
+    auto block = cg::this_thread_block();
+    const int32_t camera_id = block.group_index().x;
+    const int32_t tile_id =
+        block.group_index().y * tile_grid_width + block.group_index().z + tile_col_offset;
+    const uint32_t i = block.group_index().y * tile_height + block.thread_index().y;
+    const uint32_t j = block.group_index().z * tile_width + block.thread_index().x;
+    const uint32_t lane = block.thread_index().z;
+    // pixel slot within the tile, and this thread's staging rank
+    const uint32_t n_pix = tile_width * tile_height;
+    const uint32_t pslot = block.thread_index().y * tile_width + block.thread_index().x;
+    const uint32_t tr = lane * n_pix + pslot;
+    const uint32_t block_size = n_pix * LANES;
+    const uint32_t stage_size = block_size * BATCH_MULT_L;
+    const uint32_t slice_len = stage_size / LANES;
+
+    tile_offsets += camera_id * tile_grid_height * tile_grid_width;
+    const int32_t camera_offset = camera_id * image_height * image_width;
+    render_colors += camera_offset * COLOR_DIM;
+    render_alphas += camera_offset;
+    median_depths += camera_offset;
+    last_ids += camera_offset;
+    raster_pts += camera_offset + i * image_width + j;
+    if (backgrounds != nullptr) {
+        backgrounds += camera_id * COLOR_DIM;
+    }
+    const int32_t pix_id = i * image_width + j;
+
+    bool inside = (i < image_height && j < image_width);
+    float px = 0.f, py = 0.f, roll_time = 0.f;
+    if (inside) {
+        px = raster_pts[0].x;
+        py = raster_pts[0].y;
+        roll_time = raster_pts[0].w;
+        if (raster_pts[0].z <= 0.f) {
+            inside = false;
+        }
+    }
+
+    const int32_t range_start = tile_offsets[tile_id];
+    const int32_t range_end =
+        (camera_id == C - 1) && (tile_id == tile_grid_width * tile_grid_height - 1)
+            ? n_isects
+            : tile_offsets[tile_id + 1];
+    const uint32_t num_batches =
+        (range_end - range_start + stage_size - 1) / stage_size;
+
+    extern __shared__ int s[];
+    // Staging buffers, laid out exactly like the serial kernel's.
+    float4 *packA_batch = (float4 *)s;                        // [stage_size] STATIC
+    float4 *packB_batch = (float4 *)&packA_batch[stage_size]; // [stage_size] STATIC
+    float4 *velA_batch = (float4 *)s;                         // [stage_size]
+    float4 *velB_batch = (float4 *)&velA_batch[stage_size];   // [stage_size]
+    float2 *velC_batch = (float2 *)&velB_batch[stage_size];   // [stage_size]
+    float2 *depth_comp_batch =
+        DEPTH_COMP ? (float2 *)&velC_batch[stage_size] : nullptr;
+    // Per-(pixel, lane) partials for this stage, then per-pixel done flags.
+    float *scratch =
+        STATIC ? (float *)&packB_batch[stage_size]
+               : (DEPTH_COMP ? (float *)&depth_comp_batch[stage_size]
+                             : (float *)&velC_batch[stage_size]);
+    float *s_T = scratch;                          // [n_pix * LANES]
+    float *s_F = &s_T[n_pix * LANES];              // [n_pix * LANES * COLOR_DIM]
+    int32_t *s_last = (int32_t *)&s_F[n_pix * LANES * COLOR_DIM]; // [n_pix * LANES]
+    int32_t *s_done = &s_last[n_pix * LANES];      // [n_pix]
+
+    // Authoritative per-pixel running state, owned by the compose thread.
+    const bool composer = (lane == 0);
+    float T = 1.0f;
+    float pix_out[COLOR_DIM] = {0.f};
+    uint32_t cur_idx = 0;
+    if (composer) {
+        s_done[pslot] = inside ? 0 : 1;
+    }
+    block.sync();
+
+    // Evaluates the staged Gaussian in slot t against this thread's pixel.
+    // Returns false when it cannot contribute; otherwise fills alpha (already
+    // capped), the global Gaussian id, and the extra depth term.
+    auto eval_slot = [&](uint32_t t, float &alpha, int32_t &g,
+                         float &depth_extra) -> bool {
+        depth_extra = 0.f;
+        if constexpr (STATIC) {
+            const float4 A = packA_batch[t];
+            const float4 B = packB_batch[t];
+            if (ROW_TILE) {
+                const float dx = angle_difference(A.x, px);
+                const float sigma_row = fmaf(fmaf(A.z, dx, A.w), dx, B.x);
+                if (sigma_row < 0.f || sigma_row > B.y) {
+                    return false;
+                }
+                alpha = min(0.999f, A.y * __expf(-sigma_row));
+                if (alpha < 1.f / 255.f) {
+                    return false;
+                }
+                g = __float_as_int(B.z);
+                return true;
+            }
+            const float2 delta = {angle_difference(A.x, px), A.y - py};
+            const float3 conic = make_float3(A.w, B.x, B.y);
+            const float sigma =
+                0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) +
+                conic.y * delta.x * delta.y;
+            if (sigma < 0.f || sigma > B.w) {
+                return false;
+            }
+            alpha = min(0.999f, A.z * __expf(-sigma));
+            if (alpha < 1.f / 255.f) {
+                return false;
+            }
+            g = __float_as_int(B.z);
+            return true;
+        } else {
+            const float4 A = velA_batch[t];
+            const float4 B = velB_batch[t];
+            const float2 vxy = velC_batch[t];
+            const float2 delta = {
+                angle_difference(A.x + roll_time * vxy.x, px),
+                (A.y + roll_time * vxy.y) - py};
+            depth_extra = B.w * roll_time;
+            if (DEPTH_COMP) {
+                const float2 dc = depth_comp_batch[t];
+                depth_extra += dc.x * delta.x + dc.y * delta.y;
+            }
+            const float3 conic = make_float3(A.w, B.x, B.y);
+            const float sigma =
+                0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) +
+                conic.y * delta.x * delta.y;
+            float a = min(0.999f, A.z * __expf(-sigma));
+            if (sigma < 0.f || a < 1.f / 255.f) {
+                return false;
+            }
+            alpha = a;
+            g = __float_as_int(B.z);
+            return true;
+        }
+    };
+
+    for (uint32_t b = 0; b < num_batches; ++b) {
+        if (__syncthreads_count(s_done[pslot]) >= (int)block_size) {
+            break;
+        }
+
+        // Cooperative stage load — identical packing to the serial kernel.
+        const uint32_t batch_start = range_start + stage_size * b;
+        PRAGMA_UNROLL
+        for (uint32_t jj = 0; jj < BATCH_MULT_L; ++jj) {
+            const uint32_t slot = jj * block_size + tr;
+            const uint32_t idx = batch_start + slot;
+            if (idx >= (uint32_t)range_end) {
+                break;
+            }
+            int32_t g = flatten_ids[idx];
+            const float2 xy = means2d[g];
+            const float opac = opacities[g];
+            const float3 conic = conics[g];
+            if constexpr (STATIC) {
+                const float sigma_max = __logf(opac * 255.0f);
+                if (ROW_TILE) {
+                    const float dy = xy.y - py;
+                    const float qa = 0.5f * conic.x;
+                    const float qb = conic.y * dy;
+                    const float qc = 0.5f * conic.z * dy * dy;
+                    packA_batch[slot] = make_float4(xy.x, opac, qa, qb);
+                    packB_batch[slot] =
+                        make_float4(qc, sigma_max, __int_as_float(g), 0.f);
+                } else {
+                    packA_batch[slot] = make_float4(xy.x, xy.y, opac, conic.x);
+                    packB_batch[slot] =
+                        make_float4(conic.y, conic.z, __int_as_float(g), sigma_max);
+                }
+            } else {
+                const float3 pix_vel = pix_vels[g];
+                velA_batch[slot] = make_float4(xy.x, xy.y, opac, conic.x);
+                velB_batch[slot] =
+                    make_float4(conic.y, conic.z, __int_as_float(g), pix_vel.z);
+                velC_batch[slot] = make_float2(pix_vel.x, pix_vel.y);
+                if (DEPTH_COMP) {
+                    const float2 depth_comp = depth_compensations[g];
+                    depth_comp_batch[slot] = make_float2(depth_comp.x, depth_comp.y);
+                }
+            }
+        }
+        block.sync();
+
+        const uint32_t batch_size =
+            min(stage_size, (uint32_t)(range_end - batch_start));
+
+        // Lane pass: blend this lane's slice into a partial with T starting
+        // at 1 — no thresholds, they are order-global and resolved on compose.
+        if (!s_done[pslot]) {
+            float Tl = 1.f;
+            float Fl[COLOR_DIM] = {0.f};
+            int32_t last_l = -1;
+            const uint32_t t0 = lane * slice_len;
+            const uint32_t t1 = min(t0 + slice_len, batch_size);
+            for (uint32_t t = t0; t < t1; ++t) {
+                float alpha, depth_extra;
+                int32_t g;
+                if (!eval_slot(t, alpha, g, depth_extra)) {
+                    continue;
+                }
+                const float vis = alpha * Tl;
+                const float *c_ptr = colors + g * COLOR_DIM;
+                PRAGMA_UNROLL
+                for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                    Fl[k] += c_ptr[k] * vis;
+                }
+                Fl[depth_channel_idx] += depth_extra * vis;
+                last_l = batch_start + t;
+                Tl *= (1.0f - alpha);
+            }
+            const uint32_t sl = pslot * LANES + lane;
+            s_T[sl] = Tl;
+            PRAGMA_UNROLL
+            for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                s_F[sl * COLOR_DIM + k] = Fl[k];
+            }
+            s_last[sl] = last_l;
+        }
+        block.sync();
+
+        // Compose: fold the lane partials in depth order. Threshold crossings
+        // (T monotone within a lane) send just that lane through the serial
+        // kernel's exact per-Gaussian logic.
+        if (composer && !s_done[pslot]) {
+            for (uint32_t r = 0; r < LANES; ++r) {
+                const uint32_t sl = pslot * LANES + r;
+                const float T_after = T * s_T[sl];
+                const bool cross_done = (T_after <= 1e-4f);
+                const bool cross_median = (T > 0.5f && T_after <= 0.5f);
+                if (!cross_done && !cross_median) {
+                    PRAGMA_UNROLL
+                    for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                        pix_out[k] += T * s_F[sl * COLOR_DIM + k];
+                    }
+                    if (s_last[sl] >= 0) {
+                        cur_idx = (uint32_t)s_last[sl];
+                    }
+                    T = T_after;
+                    continue;
+                }
+                // Re-walk this lane's slice with the serial semantics.
+                const uint32_t t0 = r * slice_len;
+                const uint32_t t1 = min(t0 + slice_len, batch_size);
+                bool done = false;
+                for (uint32_t t = t0; t < t1; ++t) {
+                    float alpha, depth_extra;
+                    int32_t g;
+                    if (!eval_slot(t, alpha, g, depth_extra)) {
+                        continue;
+                    }
+                    const float next_T = T * (1.0f - alpha);
+                    if (next_T <= 1e-4f) { // exclusive, as in the serial kernel
+                        done = true;
+                        break;
+                    }
+                    const float vis = alpha * T;
+                    const float *c_ptr = colors + g * COLOR_DIM;
+                    PRAGMA_UNROLL
+                    for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                        pix_out[k] += c_ptr[k] * vis;
+                    }
+                    pix_out[depth_channel_idx] += depth_extra * vis;
+                    if (T > 0.5f && next_T <= 0.5f) {
+                        median_depths[pix_id] =
+                            c_ptr[depth_channel_idx] + depth_extra;
+                    }
+                    cur_idx = batch_start + t;
+                    T = next_T;
+                }
+                if (done) {
+                    s_done[pslot] = 1;
+                    break;
+                }
+            }
+        }
+        block.sync();
+    }
+
+    if (composer && inside) {
+        render_alphas[pix_id] = 1.0f - T;
+        PRAGMA_UNROLL
+        for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+            render_colors[pix_id * COLOR_DIM + k] =
+                backgrounds == nullptr ? pix_out[k] : (pix_out[k] + T * backgrounds[k]);
+        }
+        last_ids[pix_id] = static_cast<int32_t>(cur_idx);
+    }
+}
+
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_points_fwd_tensor(
     // Gaussian parameters
     const torch::Tensor &means2d,                   // [C, N, 2] or [nnz, 2]
@@ -789,6 +1147,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    // splatsim sector rendering: first tile-grid column this image covers
+    const uint32_t tile_col_offset,
+    // splatsim: give each pixel 16 depth lanes (see the lanes kernel). Only
+    // COLOR_DIM == 3 without compute_alpha_sum_until_points; anything else
+    // falls back to the serial kernel. Forward/inference only.
+    const bool depth_lanes,
     // compute alphas until point
     const bool compute_alpha_sum_until_points,
     const float compute_alpha_sum_until_points_threshold,
@@ -799,7 +1163,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const uint32_t depth_channel_idx,
     // splatsim: when true, skip the (zero) rolling-shutter / depth-compensation
     // terms and their shared-memory batches (see STATIC in the kernel).
-    const bool static_render
+    const bool static_render,
+    // splatsim: whether depth_compensations may be nonzero. The caller knows
+    // (rendering.py zeroes the batch when depth compensation is off); reading
+    // it back off the device cost a reduction + a host sync PER rasterization,
+    // which serialized the sector-streaming path's per-sensor streams.
+    const bool use_depth_comp
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(means2d);
@@ -823,10 +1192,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     uint32_t tile_grid_width = tile_offsets.size(2);
     uint32_t n_isects = flatten_ids.size(0);
 
-    // Each block covers a tile on the image. In total there are
-    // C * tile_grid_height * tile_grid_width blocks.
+    // Each block covers a tile on the image. The tile grid may cover a wider
+    // azimuth ring than the image (sector rendering): launch only the image's
+    // own tile columns; the kernel offsets its grid lookup by tile_col_offset.
+    const uint32_t n_pix_tiles_x = (image_width + tile_width - 1) / tile_width;
+    TORCH_CHECK(tile_col_offset + n_pix_tiles_x <= tile_grid_width,
+                "tile_col_offset (", tile_col_offset, ") + image tile columns (",
+                n_pix_tiles_x, ") exceeds the tile grid width (", tile_grid_width, ")");
     dim3 threads = {tile_width, tile_height, 1};
-    dim3 blocks = {C, tile_grid_height, tile_grid_width};
+    dim3 blocks = {C, tile_grid_height, n_pix_tiles_x};
 
     torch::Tensor renders = torch::zeros({C, image_height, image_width, channels},
                                          means2d.options().dtype(torch::kFloat32));
@@ -849,7 +1223,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // 16x the moment rolling shutter started using it.
     // splatsim: the velocity path stages two float4 + a float2 per Gaussian,
     // plus a float2 for depth compensation only when it is actually used.
-    const bool needs_depth_comp = depth_compensations.abs().max().item<float>() > 0.f;
+    const bool needs_depth_comp = use_depth_comp && !static_render;
     const uint32_t shared_mem =
         tile_width * tile_height * LIDAR_BATCH_MULT *
         (2 * sizeof(float4) + sizeof(float2) +
@@ -862,6 +1236,83 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // TODO: an optimization can be done by passing the actual number of channels into
     // the kernel functions and avoid necessary global memory writes. This requires
     // moving the channel padding from python to C side.
+    // splatsim: depth-lanes dispatch (see rasterize_to_points_fwd_lanes_kernel).
+    if (depth_lanes && channels == 3 && !compute_alpha_sum_until_points &&
+        tile_width * tile_height * 16u <= 1024u) {
+        constexpr uint32_t LANES = 16;
+        constexpr uint32_t BM_L = 2;
+        const uint32_t n_pix = tile_width * tile_height;
+        const uint32_t stage_l = n_pix * LANES * BM_L;
+        const uint32_t scratch_bytes =
+            n_pix * LANES * sizeof(float)               // s_T
+            + n_pix * LANES * 3 * sizeof(float)         // s_F
+            + n_pix * LANES * sizeof(int32_t)           // s_last
+            + n_pix * sizeof(int32_t);                  // s_done
+        const uint32_t shm_static_l =
+            stage_l * 2 * sizeof(float4) + scratch_bytes;
+        const uint32_t shm_vel_l =
+            stage_l * (2 * sizeof(float4) + sizeof(float2) +
+                       (needs_depth_comp ? sizeof(float2) : 0u)) +
+            scratch_bytes;
+        dim3 threads_l = {tile_width, tile_height, LANES};
+        const bool row_tile = (tile_height == 1);
+        void *kern_l;
+        uint32_t shm_l;
+        if (static_render) {
+            kern_l = row_tile
+                ? (void *)rasterize_to_points_fwd_lanes_kernel<3, true, true, true, LANES, BM_L>
+                : (void *)rasterize_to_points_fwd_lanes_kernel<3, true, false, true, LANES, BM_L>;
+            shm_l = shm_static_l;
+        } else {
+            kern_l = needs_depth_comp
+                ? (void *)rasterize_to_points_fwd_lanes_kernel<3, false, false, true, LANES, BM_L>
+                : (void *)rasterize_to_points_fwd_lanes_kernel<3, false, false, false, LANES, BM_L>;
+            shm_l = shm_vel_l;
+        }
+        if (cudaFuncSetAttribute(kern_l,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 shm_l) != cudaSuccess) {
+            AT_ERROR("Failed to set maximum shared memory size (requested ", shm_l,
+                     " bytes), try lowering tile_size.");
+        }
+#define LAUNCH_LANES(S_, R_, D_)                                               \
+        rasterize_to_points_fwd_lanes_kernel<3, S_, R_, D_, LANES, BM_L>       \
+            <<<blocks, threads_l, shm_l, stream>>>(                            \
+            C, N, n_isects, packed,                                            \
+            (float2 *)means2d.data_ptr<float>(),                               \
+            (float3 *)conics.data_ptr<float>(),                                \
+            colors.data_ptr<float>(),                                          \
+            opacities.data_ptr<float>(),                                       \
+            (float3 *)pix_vels.data_ptr<float>(),                              \
+            (float2 *)depth_compensations.data_ptr<float>(),                   \
+            backgrounds.has_value() ? backgrounds.value().data_ptr<float>()    \
+                                    : nullptr,                                 \
+            (float4 *)raster_pts.data_ptr<float>(),                            \
+            image_width, image_height, tile_width, tile_height,                \
+            tile_grid_width, tile_grid_height, tile_col_offset,                \
+            tile_offsets.data_ptr<int32_t>(),                                  \
+            flatten_ids.data_ptr<int32_t>(),                                   \
+            depth_channel_idx,                                                 \
+            renders.data_ptr<float>(),                                         \
+            alphas.data_ptr<float>(),                                          \
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>())
+        if (static_render) {
+            if (row_tile) {
+                LAUNCH_LANES(true, true, true);
+            } else {
+                LAUNCH_LANES(true, false, true);
+            }
+        } else {
+            if (needs_depth_comp) {
+                LAUNCH_LANES(false, false, true);
+            } else {
+                LAUNCH_LANES(false, false, false);
+            }
+        }
+#undef LAUNCH_LANES
+        return std::make_tuple(renders, alphas, last_ids, alpha_sum_until_points, median_depths);
+    }
+
     switch (channels) {
     case 1:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<1, false>,
@@ -880,7 +1331,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -908,7 +1359,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -949,7 +1400,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 (float2 *)depth_compensations.data_ptr<float>(),
                 backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
                 (float4 *)raster_pts.data_ptr<float>(),
-                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
                 compute_alpha_sum_until_points,
                 compute_alpha_sum_until_points_threshold,
                 tile_offsets.data_ptr<int32_t>(),
@@ -971,7 +1422,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 (float2 *)depth_compensations.data_ptr<float>(),
                 backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
                 (float4 *)raster_pts.data_ptr<float>(),
-                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
                 compute_alpha_sum_until_points,
                 compute_alpha_sum_until_points_threshold,
                 tile_offsets.data_ptr<int32_t>(),
@@ -1004,7 +1455,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 (float2 *)depth_compensations.data_ptr<float>(),
                 backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
                 (float4 *)raster_pts.data_ptr<float>(),
-                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
                 compute_alpha_sum_until_points,
                 compute_alpha_sum_until_points_threshold,
                 tile_offsets.data_ptr<int32_t>(),
@@ -1026,7 +1477,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 (float2 *)depth_compensations.data_ptr<float>(),
                 backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
                 (float4 *)raster_pts.data_ptr<float>(),
-                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
                 compute_alpha_sum_until_points,
                 compute_alpha_sum_until_points_threshold,
                 tile_offsets.data_ptr<int32_t>(),
@@ -1056,7 +1507,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1084,7 +1535,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1112,7 +1563,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1140,7 +1591,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1168,7 +1619,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1196,7 +1647,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1224,7 +1675,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1252,7 +1703,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1280,7 +1731,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1308,7 +1759,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1336,7 +1787,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1364,7 +1815,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1392,7 +1843,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1420,7 +1871,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1448,7 +1899,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
@@ -1476,7 +1927,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             (float2 *)depth_compensations.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
             (float4 *)raster_pts.data_ptr<float>(),
-            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+            image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height, tile_col_offset,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
             tile_offsets.data_ptr<int32_t>(),
