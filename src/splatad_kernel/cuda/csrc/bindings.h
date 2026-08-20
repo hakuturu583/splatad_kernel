@@ -16,6 +16,9 @@ fully_fused_lidar_projection_fwd_tensor(
     const at::optional<torch::Tensor> &quats,  // [N, 4] optional
     const at::optional<torch::Tensor> &scales, // [N, 3] optional
     const at::optional<torch::Tensor> &velocities, // [N, 3]
+    // splatsim: optional per-Gaussian keep mask (sector streaming) — masked
+    // Gaussians get radii = 0 without the host compacting the arrays
+    const at::optional<torch::Tensor> &valid_mask, // [N] bool optional
     const torch::Tensor &viewmats,             // [C, 4, 4]
     const float min_elevation,
     const float max_elevation,

@@ -45,6 +45,7 @@ def lidar_rasterization(
     sparse_grad: bool = False,
     absgrad: bool = False,
     tile_col_offset: int = 0,  # sector rendering, see rasterize_to_points
+    valid_mask: Optional[Tensor] = None,  # [N] bool, see fully_fused_lidar_projection
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
     channel_chunk: int = 32,
     use_depth_compensation: bool = True,
@@ -255,6 +256,7 @@ def lidar_rasterization(
         linear_velocity,
         angular_velocity,
         rolling_shutter_time,
+        valid_mask=valid_mask,
         min_elevation=min_elevation,
         max_elevation=max_elevation,
         min_azimuth=min_azimuth,

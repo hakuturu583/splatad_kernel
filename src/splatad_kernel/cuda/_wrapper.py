@@ -24,6 +24,7 @@ def fully_fused_lidar_projection(
     linear_velocity: Tensor,  # [C, 3]
     angular_velocity: Tensor,  # [C, 3]
     rolling_shutter_time: Tensor,  # [C]
+    valid_mask: Optional[Tensor] = None,  # [N] bool
     min_elevation: float = -45,
     max_elevation: float = 45,
     min_azimuth: float = -180,
@@ -71,6 +72,11 @@ def fully_fused_lidar_projection(
         linear_velocity: Linear velocity of the Lidar. [C, 3]
         angular_velocity: Angular velocity of the Lidar. [C, 3]
         rolling_shutter_time: Rolling shutter time of the Lidar. [C]
+        valid_mask: Optional per-Gaussian keep mask (bool, [N]). Masked
+          Gaussians are treated exactly like frustum-culled ones (radii = 0)
+          without the caller having to compact the input arrays — the point is
+          sector streaming, where a host-side azimuth cull would otherwise pay
+          a nonzero()/index_select (and a device sync) per sector. Default: None.
         min_elevation: Minimum elevation angle in degrees. Default: -45.
         max_elevation: Maximum elevation angle in degrees. Default: 45.
         min_azimuth: Minimum azimuth angle in degrees. Default: -180.
@@ -128,6 +134,10 @@ def fully_fused_lidar_projection(
     if velocities is not None:
         assert velocities.size() == (N, 3), velocities.size()
         velocities = velocities.contiguous()
+    if valid_mask is not None:
+        assert valid_mask.shape == (N,), valid_mask.shape
+        assert valid_mask.dtype == torch.bool, valid_mask.dtype
+        valid_mask = valid_mask.contiguous()
     if sparse_grad:
         assert packed, "sparse_grad is only supported when packed is True"
 
@@ -143,6 +153,7 @@ def fully_fused_lidar_projection(
             quats,
             scales,
             velocities,
+            valid_mask,
             viewmats,
             min_elevation,
             max_elevation,
@@ -454,6 +465,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
         quats: Tensor,  # [N, 4] or None
         scales: Tensor,  # [N, 3] or None
         velocities: Tensor,  # [N, 3] or None
+        valid_mask: Tensor,  # [N] bool or None
         viewmats: Tensor,  # [C, 4, 4]
         min_elevation: float,
         max_elevation: float,
@@ -476,6 +488,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
                 quats,
                 scales,
                 velocities,
+                valid_mask,
                 viewmats,
                 min_elevation,
                 max_elevation,
@@ -581,7 +594,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
             v_compensations,
             v_pix_vels.contiguous(),
             v_depth_compensations.contiguous(),
-            ctx.needs_input_grad[5],  # viewmats_requires_grad
+            ctx.needs_input_grad[6],  # viewmats_requires_grad
         )
         if not ctx.needs_input_grad[0]:
             v_means = None
@@ -591,7 +604,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
             v_quats = None
         if not ctx.needs_input_grad[3]:
             v_scales = None
-        if not ctx.needs_input_grad[5]:
+        if not ctx.needs_input_grad[6]:
             v_viewmats = None
         return (
             v_means,
@@ -599,6 +612,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
             v_quats,
             v_scales,
             None,
+            None,  # valid_mask
             v_viewmats,
             None,
             None,
