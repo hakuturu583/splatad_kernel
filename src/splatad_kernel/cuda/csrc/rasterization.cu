@@ -807,7 +807,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const uint32_t depth_channel_idx,
     // splatsim: when true, skip the (zero) rolling-shutter / depth-compensation
     // terms and their shared-memory batches (see STATIC in the kernel).
-    const bool static_render
+    const bool static_render,
+    // splatsim: whether depth_compensations may be nonzero. The caller knows
+    // (rendering.py zeroes the batch when depth compensation is off); reading
+    // it back off the device cost a reduction + a host sync PER rasterization,
+    // which serialized the sector-streaming path's per-sensor streams.
+    const bool use_depth_comp
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(means2d);
@@ -862,7 +867,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // 16x the moment rolling shutter started using it.
     // splatsim: the velocity path stages two float4 + a float2 per Gaussian,
     // plus a float2 for depth compensation only when it is actually used.
-    const bool needs_depth_comp = depth_compensations.abs().max().item<float>() > 0.f;
+    const bool needs_depth_comp = use_depth_comp && !static_render;
     const uint32_t shared_mem =
         tile_width * tile_height * LIDAR_BATCH_MULT *
         (2 * sizeof(float4) + sizeof(float2) +

@@ -370,6 +370,7 @@ def lidar_rasterization(
                 absgrad=absgrad,
                 static_render=static_render,
                 tile_col_offset=tile_col_offset,
+                use_depth_comp=use_depth_compensation,
             )
             if i == (n_chunks - 1):
                 render_lidar_features.append(render_lidar_features_)
@@ -404,6 +405,7 @@ def lidar_rasterization(
                 absgrad=absgrad,
                 static_render=static_render,
                 tile_col_offset=tile_col_offset,
+                use_depth_comp=use_depth_compensation,
             )
         )
 

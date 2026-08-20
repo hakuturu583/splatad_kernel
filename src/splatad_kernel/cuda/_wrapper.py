@@ -291,6 +291,7 @@ def rasterize_to_points(
     absgrad: bool = False,
     static_render: bool = False,
     tile_col_offset: int = 0,
+    use_depth_comp: bool = True,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor]:
     """Rasterizes Gaussians to points.
 
@@ -433,6 +434,7 @@ def rasterize_to_points(
             absgrad,
             depth_channel_idx,
             static_render,
+            use_depth_comp,
         )
     )
 
@@ -639,6 +641,7 @@ class _RasterizeToPoints(torch.autograd.Function):
         absgrad: bool,
         depth_channel_idx: int,
         static_render: bool = False,
+        use_depth_comp: bool = True,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
         (
             render_colors,
@@ -666,6 +669,7 @@ class _RasterizeToPoints(torch.autograd.Function):
             flatten_ids,
             depth_channel_idx,
             static_render,
+            use_depth_comp,
         )
 
         ctx.save_for_backward(
@@ -805,6 +809,6 @@ class _RasterizeToPoints(torch.autograd.Function):
             None,
             None,
             None,
-            None,
             None,  # static_render
+            None,  # use_depth_comp
         )

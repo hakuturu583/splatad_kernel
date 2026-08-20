@@ -104,7 +104,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // depth channel index
     const uint32_t depth_channel_idx,
     // splatsim: skip zero rolling-shutter / depth-comp terms (static fast path)
-    const bool static_render
+    const bool static_render,
+    // splatsim: host-known "depth_compensations may be nonzero" flag; avoids a
+    // device reduction + sync per rasterization
+    const bool use_depth_comp
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
