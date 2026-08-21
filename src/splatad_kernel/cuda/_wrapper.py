@@ -290,7 +290,7 @@ def rasterize_to_points(
     packed: bool = False,
     absgrad: bool = False,
     static_render: bool = False,
-) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor, Tensor, Tensor]:
     """Rasterizes Gaussians to points.
 
     Args:
@@ -412,6 +412,7 @@ def rasterize_to_points(
         alpha_sum_until_points,
         median_depths,
         fr_depth,
+        median_ids,
     ) = (
         _RasterizeToPoints.apply(
             means2d.contiguous(),
@@ -444,6 +445,7 @@ def rasterize_to_points(
         alpha_sum_until_points,
         median_depths,
         fr_depth,
+        median_ids,
     )
 
 
@@ -653,6 +655,7 @@ class _RasterizeToPoints(torch.autograd.Function):
             median_depths,
             fr_depth,
             fr_weight,
+            median_ids,
         ) = _make_lazy_cuda_func("rasterize_to_points_fwd")(
             means2d,
             conics,
@@ -709,8 +712,10 @@ class _RasterizeToPoints(torch.autograd.Function):
         # fr_depth (soft-first-return) is DIFFERENTIABLE: its v_fr_depth backward propagates to
         # means/opacity/scale over the first-surface prefix. fr_weight is internal (saved for the
         # backward's 1/D normalization). median_depths carries no grad (hard selection; the
-        # backward returns None for it) — deploy/BEV only.
-        return render_colors, render_alphas, alpha_sum_until_points, median_depths, fr_depth
+        # backward returns None for it) — deploy/BEV only. median_ids is the int crossing-gaussian
+        # index for the autograd median-range GATHER (means[median_ids]) — non-diff itself.
+        ctx.mark_non_differentiable(median_ids)
+        return render_colors, render_alphas, alpha_sum_until_points, median_depths, fr_depth, median_ids
 
     @staticmethod
     def backward(
@@ -720,6 +725,7 @@ class _RasterizeToPoints(torch.autograd.Function):
         v_alpha_sum_until_points: Tensor,  # [C, H, W, 1]
         v_median_depths: Tensor,  # [C, H, W, 1]
         v_fr_depth: Tensor,  # [C, H, W, 1] upstream grad of soft-first-return depth (-> means/opacity/scale)
+        v_median_ids: Tensor,  # [C, H, W] None (median_ids is non-differentiable; gather grad flows via means)
     ):
         (
             means2d,
