@@ -163,9 +163,23 @@ except ImportError:
                 )
 
     else:
-        Console().print(
-            "[yellow]gsplat: No CUDA toolkit found. gsplat will be disabled.[/yellow]"
-        )
+        # No CUDA toolkit (no nvcc on PATH): load a pre-compiled .so directly.
+        # This is the deployment path -- a builder image with nvcc JITs the
+        # extension into TORCH_EXTENSIONS_DIR and the runtime image (CUDA
+        # runtime libraries only) imports the artifact without rebuilding.
+        # Mirrors the fallback splatsim's Dockerfile patches into gsplat's
+        # _backend.py; without it _C stays None and every LiDAR render fails.
+        name = "splatad_kernel_cuda"
+        build_dir = _get_build_directory(name, verbose=False)
+        so_path = os.path.join(build_dir, f"{name}.so")
+        if os.path.exists(so_path):
+            _C = _import_module_from_library(name, build_dir, True)
+        else:
+            Console().print(
+                "[yellow]splatad_kernel: No CUDA toolkit found and no "
+                "pre-compiled splatad_kernel_cuda.so in the torch extensions "
+                "dir. splatad_kernel will be disabled.[/yellow]"
+            )
 
 if need_to_unset_max_jobs:
     os.environ.pop("MAX_JOBS")
