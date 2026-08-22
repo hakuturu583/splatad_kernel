@@ -472,7 +472,10 @@ __global__ void rasterize_to_points_fwd_kernel(
     float *__restrict__ render_alphas,             // [C, image_height, image_width, 1]
     float *__restrict__ alpha_sum_until_points,    // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids,                 // [C, image_height, image_width]
-    float *__restrict__ median_depths    // [C, image_height, image_width, 1]
+    float *__restrict__ median_depths,   // [C, image_height, image_width, 1]
+    float *__restrict__ fr_depth,        // [C, image_height, image_width, 1]  (DIFFERENTIABLE soft-first-return: alpha-weighted expected range over the FIRST-surface prefix T_i>0.5. D=Σ_{T>0.5} vis·rng / Σ_{T>0.5} vis; -> hard median as the first surface sharpens. Grads means/opacity/scale via the backward.)
+    float *__restrict__ fr_weight,       // [C, image_height, image_width, 1]  (Σ_{T>0.5} vis — the fr denominator, saved for the fr backward normalization.)
+    int32_t *__restrict__ median_ids     // [C, image_height, image_width]  (GLOBAL gaussian index at the 0.5-transmittance crossing, -1 if none; for the autograd median-range GATHER means[median_ids] — hard first-return, non-diff selection but the selected mean's position IS differentiable.)
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -489,6 +492,9 @@ __global__ void rasterize_to_points_fwd_kernel(
     render_colors += camera_offset * COLOR_DIM;
     render_alphas += camera_offset;
     median_depths += camera_offset;
+    if (fr_depth != nullptr) { fr_depth += camera_offset; }
+    if (fr_weight != nullptr) { fr_weight += camera_offset; }
+    if (median_ids != nullptr) { median_ids += camera_offset; }
     if (compute_alpha_sum_until_points && (alpha_sum_until_points != nullptr)) {
         alpha_sum_until_points += camera_offset;
     }
@@ -573,6 +579,7 @@ __global__ void rasterize_to_points_fwd_kernel(
     uint32_t tr = block.thread_rank();
 
     float pix_out[COLOR_DIM] = {0.f};
+    float fr_num = 0.f, fr_den = 0.f;  // soft-first-return: Σ_{T>0.5} vis·rng and Σ_{T>0.5} vis
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before beginning next batch
         // end early if entire tile is done
@@ -673,8 +680,12 @@ __global__ void rasterize_to_points_fwd_kernel(
                     for (uint32_t kk = 0; kk < COLOR_DIM; ++kk) {
                         pix_out[kk] += c_row[kk] * vis_row;
                     }
+                    // soft-first-return: accumulate over the first-surface prefix (T>0.5). STATIC
+                    // path has no depth tilt, so range == c_row[depth_channel_idx].
+                    if (T > 0.5f) { fr_num += c_row[depth_channel_idx] * vis_row; fr_den += vis_row; }
                     if (T > 0.5f && next_T_row <= 0.5f) {
                         median_depths[pix_id] = c_row[depth_channel_idx];
+                        if (median_ids != nullptr) { median_ids[pix_id] = g_row; }
                     }
                     if (compute_alpha_sum_until_points) {
                         const float g_depth = c_row[depth_channel_idx];
@@ -744,9 +755,12 @@ __global__ void rasterize_to_points_fwd_kernel(
                 pix_out[k] += c_ptr[k] * vis;
             }
             pix_out[depth_channel_idx] += depth_extra * vis;
+            // soft-first-return prefix accumulation (general path: range includes depth tilt).
+            if (T > 0.5f) { fr_num += (c_ptr[depth_channel_idx] + depth_extra) * vis; fr_den += vis; }
             if (T > 0.5 && next_T <= 0.5) {
                 // median depth of the gaussian
                 median_depths[pix_id] = c_ptr[depth_channel_idx] + depth_extra;
+                if (median_ids != nullptr) { median_ids[pix_id] = g; }
             }
             // depth of the gaussian is assumed to be the last channel
             if (compute_alpha_sum_until_points) {
@@ -769,6 +783,8 @@ __global__ void rasterize_to_points_fwd_kernel(
         // However, double precision makes the backward pass 1.5x slower so we stick
         // with float for now.
         render_alphas[pix_id] = 1.0f - T;
+        if (fr_depth != nullptr) { fr_depth[pix_id] = (fr_den > 1e-6f) ? (fr_num / fr_den) : 0.f; }
+        if (fr_weight != nullptr) { fr_weight[pix_id] = fr_den; }
         PRAGMA_UNROLL
         for (uint32_t k = 0; k < COLOR_DIM; ++k) {
             render_colors[pix_id * COLOR_DIM + k] =
@@ -1131,7 +1147,7 @@ __global__ void rasterize_to_points_fwd_lanes_kernel(
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_points_fwd_tensor(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_points_fwd_tensor(
     // Gaussian parameters
     const torch::Tensor &means2d,                   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,                    // [C, N, 3] or [nnz, 3]
@@ -1208,6 +1224,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                                         means2d.options().dtype(torch::kFloat32));
     torch::Tensor median_depths = torch::zeros({C, image_height, image_width, 1},
                                         means2d.options().dtype(torch::kFloat32));
+    torch::Tensor fr_depth = torch::zeros({C, image_height, image_width, 1},
+                                          means2d.options().dtype(torch::kFloat32));
+    torch::Tensor fr_weight = torch::zeros({C, image_height, image_width, 1},
+                                           means2d.options().dtype(torch::kFloat32));
     torch::Tensor alpha_sum_until_points;
     if (compute_alpha_sum_until_points) {
         alpha_sum_until_points = torch::zeros({C, image_height, image_width, 1},
@@ -1215,6 +1235,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     }
     torch::Tensor last_ids = torch::zeros({C, image_height, image_width},
                                           means2d.options().dtype(torch::kInt32));
+    // -1 = no 0.5 crossing in this bin (kernel writes the crossing gaussian's global index).
+    torch::Tensor median_ids = torch::full({C, image_height, image_width}, -1,
+                                           means2d.options().dtype(torch::kInt32));
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     // splatsim: BOTH paths stage LIDAR_BATCH_MULT Gaussians per thread per round
@@ -1237,6 +1260,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // the kernel functions and avoid necessary global memory writes. This requires
     // moving the channel padding from python to C side.
     // splatsim: depth-lanes dispatch (see rasterize_to_points_fwd_lanes_kernel).
+    // The lanes kernel is forward/inference only and does not produce the
+    // training-side outputs: it leaves fr_depth/fr_weight at 0 and median_ids
+    // at -1. Callers that need those (trainers) must not pass depth_lanes.
     if (depth_lanes && channels == 3 && !compute_alpha_sum_until_points &&
         tile_width * tile_height * 16u <= 1024u) {
         constexpr uint32_t LANES = 16;
@@ -1310,7 +1336,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             }
         }
 #undef LAUNCH_LANES
-        return std::make_tuple(renders, alphas, last_ids, alpha_sum_until_points, median_depths);
+        // fr_depth/fr_weight stay zero and median_ids stays -1 on this path
+        // (see the dispatch comment above).
+        return std::make_tuple(renders, alphas, last_ids, alpha_sum_until_points, median_depths, fr_depth, fr_weight, median_ids);
     }
 
     switch (channels) {
@@ -1340,7 +1368,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 2:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<2, false>,
@@ -1368,7 +1396,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 3:
         // splatsim: dispatch the static (no rolling-shutter / no depth-comp)
@@ -1409,7 +1437,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 renders.data_ptr<float>(),
                 alphas.data_ptr<float>(),
                 compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
             } else {
                 rasterize_to_points_fwd_kernel<3, true, false>
                     <<<blocks, threads, shared_mem_static, stream>>>(
@@ -1431,7 +1459,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 renders.data_ptr<float>(),
                 alphas.data_ptr<float>(),
                 compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
             }
         } else {
             auto kern_v = needs_depth_comp
@@ -1464,7 +1492,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 renders.data_ptr<float>(),
                 alphas.data_ptr<float>(),
                 compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
             } else {
             rasterize_to_points_fwd_kernel<3, false, false, false>
                 <<<blocks, threads, shared_mem, stream>>>(
@@ -1486,7 +1514,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 renders.data_ptr<float>(),
                 alphas.data_ptr<float>(),
                 compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
             }
         }
         break;
@@ -1516,7 +1544,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 5:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<5, false>,
@@ -1544,7 +1572,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 8:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<8, false>,
@@ -1572,7 +1600,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 9:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<9, false>,
@@ -1600,7 +1628,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 16:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<16, false>,
@@ -1628,7 +1656,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 17:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<17, false>,
@@ -1656,7 +1684,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 32:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<32, false>,
@@ -1684,7 +1712,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 33:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<33, false>,
@@ -1712,7 +1740,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 64:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<64, false>,
@@ -1740,7 +1768,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 65:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<65, false>,
@@ -1768,7 +1796,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 128:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<128, false>,
@@ -1796,7 +1824,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 129:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<129, false>,
@@ -1824,7 +1852,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 256:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<256, false>,
@@ -1852,7 +1880,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 257:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<257, false>,
@@ -1880,7 +1908,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 512:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<512, false>,
@@ -1908,7 +1936,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     case 513:
         if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<513, false>,
@@ -1936,12 +1964,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
-            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>(), fr_depth.data_ptr<float>(), fr_weight.data_ptr<float>(), median_ids.data_ptr<int32_t>());
         break;
     default:
         AT_ERROR("Unsupported number of channels: ", channels);
     }
-    return std::make_tuple(renders, alphas, last_ids, alpha_sum_until_points, median_depths);
+    return std::make_tuple(renders, alphas, last_ids, alpha_sum_until_points, median_depths, fr_depth, fr_weight, median_ids);
 }
 
 template <uint32_t COLOR_DIM>
@@ -1970,10 +1998,13 @@ __global__ void rasterize_to_points_bwd_kernel(
     // fwd outputs
     const float *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     const int32_t *__restrict__ last_ids,    // [C, image_height, image_width]
+    const float *__restrict__ fr_depth,      // [C, image_height, image_width, 1]  soft-first-return depth (fwd out)
+    const float *__restrict__ fr_weight,     // [C, image_height, image_width, 1]  fr denominator D=Σ_{T>0.5} vis (fwd out)
     // grad outputs
     const float *__restrict__ v_render_colors, // [C, image_height, image_width, COLOR_DIM]
     const float *__restrict__ v_render_alphas, // [C, image_height, image_width, 1]
     const float *__restrict__ v_alpha_sum_until_points, // [C, image_height, image_width, 1]
+    const float *__restrict__ v_fr_depth,    // [C, image_height, image_width, 1]  upstream grad of soft-first-return depth
     // grad inputs
     float2 *__restrict__ v_means2d_abs, // [C, N, 2] or [nnz, 2]
     float2 *__restrict__ v_means2d,     // [C, N, 2] or [nnz, 2]
@@ -1993,6 +2024,12 @@ __global__ void rasterize_to_points_bwd_kernel(
     const int32_t camera_offset = camera_id * image_height * image_width;
     render_alphas += camera_offset;
     last_ids += camera_offset;
+    const bool has_fr = (v_fr_depth != nullptr && fr_depth != nullptr && fr_weight != nullptr);
+    if (has_fr) {
+        fr_depth += camera_offset;
+        fr_weight += camera_offset;
+        v_fr_depth += camera_offset;
+    }
     raster_pts += camera_offset + i * image_width + j;
     v_render_colors += camera_offset * COLOR_DIM;
     v_render_alphas += camera_offset;
@@ -2047,6 +2084,21 @@ __global__ void rasterize_to_points_bwd_kernel(
     float T = T_final;
     // the contribution from gaussians behind the current one
     float buffer[COLOR_DIM] = {0.f};
+    // soft-first-return (fr) backward: fr = fr_num/D over the first-surface prefix (T>0.5).
+    // df/d(fr_num)=v_fr/D, df/d(fr_den)=-v_fr*fr/D. These two virtual composited channels
+    // (color=rng and color=1, gated to prefix) reuse the SAME alpha/T-chain machinery as the
+    // real channels, so we keep a running buffer for each (Σ over strictly-deeper prefix gauss).
+    float buffer_frnum = 0.f, buffer_frden = 0.f;
+    float fr_val = 0.f, v_frnum = 0.f, v_frden = 0.f;
+    if (inside && has_fr) {
+        const float D = fr_weight[pix_id];
+        if (D > 1e-6f) {
+            const float vfr = v_fr_depth[pix_id];
+            fr_val = fr_depth[pix_id];
+            v_frnum = vfr / D;          // df/d(fr_num)
+            v_frden = -vfr * fr_val / D; // df/d(fr_den)
+        }
+    }
     // index of last gaussian to contribute to this pixel
     const int32_t bin_final = inside ? last_ids[pix_id] : 0;
 
@@ -2175,6 +2227,27 @@ __global__ void rasterize_to_points_bwd_kernel(
                     v_alpha += -T_final * ra * accum;
                 }
 
+                // ---- soft-first-return (fr) gradient: only over the first-surface prefix (T>0.5),
+                // matching the forward accumulation. rng_i and vis_i(=fac) form two virtual
+                // composited channels: fr_num=Σ_{prefix} vis·rng, fr_den=Σ_{prefix} vis, fr=fr_num/D.
+                // Straight-through: prefix membership held fixed (the 0.5-crossing move is dropped).
+                if (has_fr && (v_frnum != 0.f || v_frden != 0.f) && T > 0.5f) {
+                    const float depth_extra_bwd =
+                        depth_comp.x * delta.x + depth_comp.y * delta.y + pix_vel.z * roll_time;
+                    const float rng_i =
+                        rgbs_batch[t * COLOR_DIM + depth_channel_idx] + depth_extra_bwd;
+                    // (a) fr_num's direct dependence on this gaussian's range (depth color + tilt):
+                    //     routed through v_rgb_local[depth] so the depth_comp/pix_vel/means grads
+                    //     below (lines using v_rgb_local[depth_channel_idx]) pick it up.
+                    v_rgb_local[depth_channel_idx] += v_frnum * fac;
+                    // (b) fr_num/fr_den dependence on this gaussian's alpha AND the transmittance
+                    //     chain over strictly-deeper prefix gaussians (buffer_fr* = Σ …·fac).
+                    v_alpha += (rng_i * T - buffer_frnum * ra) * v_frnum;
+                    v_alpha += (1.0f  * T - buffer_frden * ra) * v_frden;
+                    buffer_frnum += rng_i * fac;
+                    buffer_frden += fac;
+                }
+
                 if (opac * vis <= 0.999f) {
                     v_depth_comp_local = {v_rgb_local[depth_channel_idx] * delta.x, v_rgb_local[depth_channel_idx] * delta.y};
                     v_pix_vel_local.z = v_rgb_local[depth_channel_idx] * roll_time;
@@ -2293,10 +2366,13 @@ rasterize_to_points_bwd_tensor(
     // forward outputs
     const torch::Tensor &render_alphas, // [C, image_height, image_width, 1]
     const torch::Tensor &last_ids,      // [C, image_height, image_width]
+    const at::optional<torch::Tensor> &fr_depth,  // [C, image_height, image_width, 1] soft-first-return depth (fwd out)
+    const at::optional<torch::Tensor> &fr_weight, // [C, image_height, image_width, 1] fr denominator D (fwd out)
     // gradients of outputs
     const torch::Tensor &v_render_colors, // [C, image_height, image_width, 3]
     const torch::Tensor &v_render_alphas, // [C, image_height, image_width, 1]
     const torch::Tensor &v_alpha_sum_until_points, // [C, image_height, image_width, 1])
+    const at::optional<torch::Tensor> &v_fr_depth, // [C, image_height, image_width, 1] upstream grad of fr depth
     // options
     bool absgrad,
     const bool compute_alpha_sum_until_points,
@@ -2347,6 +2423,13 @@ rasterize_to_points_bwd_tensor(
         v_means2d_abs = torch::zeros_like(means2d);
     }
 
+    // soft-first-return backward pointers (all-or-nothing: only when the upstream fr grad
+    // and both fr fwd outputs are present). Otherwise nullptr -> the fr terms are skipped.
+    const bool fr_bwd = fr_depth.has_value() && fr_weight.has_value() && v_fr_depth.has_value();
+    const float *fr_depth_ptr = fr_bwd ? fr_depth.value().data_ptr<float>() : nullptr;
+    const float *fr_weight_ptr = fr_bwd ? fr_weight.value().data_ptr<float>() : nullptr;
+    const float *v_fr_depth_ptr = fr_bwd ? v_fr_depth.value().data_ptr<float>() : nullptr;
+
     if (n_isects) {
         const uint32_t shared_mem = tile_width * tile_height *
                                     (sizeof(int32_t) + sizeof(float3) + sizeof(float3) +
@@ -2379,9 +2462,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2416,9 +2502,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2453,9 +2542,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2490,9 +2582,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2527,9 +2622,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2564,9 +2662,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2601,9 +2702,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2638,9 +2742,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2675,9 +2782,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2712,9 +2822,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2749,9 +2862,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2786,9 +2902,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2823,9 +2942,12 @@ rasterize_to_points_bwd_tensor(
                 depth_channel_idx,
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                fr_depth_ptr,
+                fr_weight_ptr,
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 v_alpha_sum_until_points.data_ptr<float>(),
+                v_fr_depth_ptr,
                 absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                 (float2 *)v_means2d.data_ptr<float>(),
                 (float3 *)v_conics.data_ptr<float>(),
@@ -2861,9 +2983,12 @@ rasterize_to_points_bwd_tensor(
                     depth_channel_idx,
                     render_alphas.data_ptr<float>(),
                     last_ids.data_ptr<int32_t>(),
+                    fr_depth_ptr,
+                    fr_weight_ptr,
                     v_render_colors.data_ptr<float>(),
                     v_render_alphas.data_ptr<float>(),
                     v_alpha_sum_until_points.data_ptr<float>(),
+                    v_fr_depth_ptr,
                     absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                     (float2 *)v_means2d.data_ptr<float>(),
                     (float3 *)v_conics.data_ptr<float>(),
@@ -2899,9 +3024,12 @@ rasterize_to_points_bwd_tensor(
                     depth_channel_idx,
                     render_alphas.data_ptr<float>(),
                     last_ids.data_ptr<int32_t>(),
+                    fr_depth_ptr,
+                    fr_weight_ptr,
                     v_render_colors.data_ptr<float>(),
                     v_render_alphas.data_ptr<float>(),
                     v_alpha_sum_until_points.data_ptr<float>(),
+                    v_fr_depth_ptr,
                     absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                     (float2 *)v_means2d.data_ptr<float>(),
                     (float3 *)v_conics.data_ptr<float>(),
@@ -2937,9 +3065,12 @@ rasterize_to_points_bwd_tensor(
                     depth_channel_idx,
                     render_alphas.data_ptr<float>(),
                     last_ids.data_ptr<int32_t>(),
+                    fr_depth_ptr,
+                    fr_weight_ptr,
                     v_render_colors.data_ptr<float>(),
                     v_render_alphas.data_ptr<float>(),
                     v_alpha_sum_until_points.data_ptr<float>(),
+                    v_fr_depth_ptr,
                     absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                     (float2 *)v_means2d.data_ptr<float>(),
                     (float3 *)v_conics.data_ptr<float>(),
@@ -2975,9 +3106,12 @@ rasterize_to_points_bwd_tensor(
                     depth_channel_idx,
                     render_alphas.data_ptr<float>(),
                     last_ids.data_ptr<int32_t>(),
+                    fr_depth_ptr,
+                    fr_weight_ptr,
                     v_render_colors.data_ptr<float>(),
                     v_render_alphas.data_ptr<float>(),
                     v_alpha_sum_until_points.data_ptr<float>(),
+                    v_fr_depth_ptr,
                     absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                     (float2 *)v_means2d.data_ptr<float>(),
                     (float3 *)v_conics.data_ptr<float>(),
@@ -3013,9 +3147,12 @@ rasterize_to_points_bwd_tensor(
                     depth_channel_idx,
                     render_alphas.data_ptr<float>(),
                     last_ids.data_ptr<int32_t>(),
+                    fr_depth_ptr,
+                    fr_weight_ptr,
                     v_render_colors.data_ptr<float>(),
                     v_render_alphas.data_ptr<float>(),
                     v_alpha_sum_until_points.data_ptr<float>(),
+                    v_fr_depth_ptr,
                     absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                     (float2 *)v_means2d.data_ptr<float>(),
                     (float3 *)v_conics.data_ptr<float>(),
@@ -3051,9 +3188,12 @@ rasterize_to_points_bwd_tensor(
                     depth_channel_idx,
                     render_alphas.data_ptr<float>(),
                     last_ids.data_ptr<int32_t>(),
+                    fr_depth_ptr,
+                    fr_weight_ptr,
                     v_render_colors.data_ptr<float>(),
                     v_render_alphas.data_ptr<float>(),
                     v_alpha_sum_until_points.data_ptr<float>(),
+                    v_fr_depth_ptr,
                     absgrad ? (float2 *)v_means2d_abs.data_ptr<float>() : nullptr,
                     (float2 *)v_means2d.data_ptr<float>(),
                     (float3 *)v_conics.data_ptr<float>(),

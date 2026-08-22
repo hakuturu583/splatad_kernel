@@ -304,7 +304,7 @@ def rasterize_to_points(
     tile_col_offset: int = 0,
     use_depth_comp: bool = True,
     depth_lanes: bool = False,
-) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor]:
+) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor, Tensor, Tensor]:
     """Rasterizes Gaussians to points.
 
     Args:
@@ -338,7 +338,9 @@ def rasterize_to_points(
             float-epsilon level (deterministic). Only lidar_features with 3
             channels and compute_alpha_sum_until_points=False take this path;
             anything else silently falls back to the serial kernel.
-            Forward/inference only (backward refuses). Default: False.
+            Forward/inference only (backward refuses). Does not produce the
+            training-side outputs: fr_depth comes back all-zero and median_ids
+            all -1 on this path. Default: False.
 
     Returns:
         A tuple:
@@ -347,6 +349,9 @@ def rasterize_to_points(
         - **Rendered alphas**. [C, image_height, image_width, 1]
         - **alpha_sum_until_points**. [C, image_height, image_width, 1].
         - **median_depths**. [C, image_height, image_width, 1].
+        - **fr_depth**. Soft first-return depth. [C, image_height, image_width, 1].
+        - **median_ids**. Global gaussian index at the 0.5 crossing, -1 if none.
+          [C, image_height, image_width, 1].
     """
 
     C = isect_offsets.size(0)
@@ -433,7 +438,14 @@ def rasterize_to_points(
         4,
     ), "raster_pts does not have the correct shape"
 
-    render_lidar_features, render_alphas, alpha_sum_until_points, median_depths = (
+    (
+        render_lidar_features,
+        render_alphas,
+        alpha_sum_until_points,
+        median_depths,
+        fr_depth,
+        median_ids,
+    ) = (
         _RasterizeToPoints.apply(
             means2d.contiguous(),
             conics.contiguous(),
@@ -462,7 +474,14 @@ def rasterize_to_points(
 
     if padded_channels > 0:
         render_lidar_features = render_lidar_features[..., :-padded_channels]
-    return render_lidar_features, render_alphas, alpha_sum_until_points, median_depths
+    return (
+        render_lidar_features,
+        render_alphas,
+        alpha_sum_until_points,
+        median_depths,
+        fr_depth,
+        median_ids,
+    )
 
 
 class _FullyFusedLidarProjection(torch.autograd.Function):
@@ -675,6 +694,9 @@ class _RasterizeToPoints(torch.autograd.Function):
             last_ids,
             alpha_sum_until_points,
             median_depths,
+            fr_depth,
+            fr_weight,
+            median_ids,
         ) = _make_lazy_cuda_func("rasterize_to_points_fwd")(
             means2d,
             conics,
@@ -712,6 +734,8 @@ class _RasterizeToPoints(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
+            fr_depth,
+            fr_weight,
         )
         ctx.width = width
         ctx.height = height
@@ -731,7 +755,13 @@ class _RasterizeToPoints(torch.autograd.Function):
         alpha_sum_until_points = (
             alpha_sum_until_points.float() if compute_alpha_sum_until_points else None
         )
-        return render_colors, render_alphas, alpha_sum_until_points, median_depths
+        # fr_depth (soft-first-return) is DIFFERENTIABLE: its v_fr_depth backward propagates to
+        # means/opacity/scale over the first-surface prefix. fr_weight is internal (saved for the
+        # backward's 1/D normalization). median_depths carries no grad (hard selection; the
+        # backward returns None for it) — deploy/BEV only. median_ids is the int crossing-gaussian
+        # index for the autograd median-range GATHER (means[median_ids]) — non-diff itself.
+        ctx.mark_non_differentiable(median_ids)
+        return render_colors, render_alphas, alpha_sum_until_points, median_depths, fr_depth, median_ids
 
     @staticmethod
     def backward(
@@ -740,6 +770,8 @@ class _RasterizeToPoints(torch.autograd.Function):
         v_render_alphas: Tensor,  # [C, H, W, 1]
         v_alpha_sum_until_points: Tensor,  # [C, H, W, 1]
         v_median_depths: Tensor,  # [C, H, W, 1]
+        v_fr_depth: Tensor,  # [C, H, W, 1] upstream grad of soft-first-return depth (-> means/opacity/scale)
+        v_median_ids: Tensor,  # [C, H, W] None (median_ids is non-differentiable; gather grad flows via means)
     ):
         (
             means2d,
@@ -754,6 +786,8 @@ class _RasterizeToPoints(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
+            fr_depth,
+            fr_weight,
         ) = ctx.saved_tensors
         width = ctx.width
         height = ctx.height
@@ -803,11 +837,14 @@ class _RasterizeToPoints(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
+            fr_depth,
+            fr_weight,
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
             v_alpha_sum_until_points.contiguous()
             if compute_alpha_sum_until_points
             else torch.zeros_like(v_render_alphas),
+            v_fr_depth.contiguous() if v_fr_depth is not None else None,
             absgrad,
             compute_alpha_sum_until_points,
             compute_alpha_sum_until_points_threshold,
@@ -832,18 +869,19 @@ class _RasterizeToPoints(torch.autograd.Function):
             v_pix_vels,
             v_depth_compensations,
             v_backgrounds,
-            None,
-            None,
-            None,
-            None,
+            None,  # raster_pts
+            None,  # width
+            None,  # height
+            None,  # tile_width
+            None,  # tile_height
             None,  # tile_col_offset
             None,  # depth_lanes
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # isect_offsets
+            None,  # flatten_ids
+            None,  # compute_alpha_sum_until_points
+            None,  # compute_alpha_sum_until_points_threshold
+            None,  # absgrad
+            None,  # depth_channel_idx
             None,  # static_render
             None,  # use_depth_comp
         )
