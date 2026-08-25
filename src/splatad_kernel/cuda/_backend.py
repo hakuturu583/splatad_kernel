@@ -89,14 +89,17 @@ def gsplat_include_paths():
     root = os.path.dirname(os.path.abspath(gsplat.__file__))
     include = os.path.join(root, "cuda", "include")
     glm = os.path.join(root, "cuda", "csrc", "third_party", "glm")
-    for path in (include, glm):
+    # camera files (ported from the original SplatAD fork) include glm via
+    # "third_party/glm/glm/glm.hpp" relative paths -> expose gsplat csrc too.
+    csrc = os.path.join(root, "cuda", "csrc")
+    for path in (include, glm, csrc):
         if not os.path.isdir(path):
             raise RuntimeError(
                 f"gsplat is installed at {root} but {path} is missing; "
                 "splatad_kernel compiles against gsplat's CUDA headers and "
                 "needs an install that ships them."
             )
-    return [include, glm]
+    return [include, glm, csrc]
 
 
 _C = None
