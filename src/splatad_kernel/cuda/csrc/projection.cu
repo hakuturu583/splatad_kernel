@@ -18,6 +18,12 @@ fully_fused_lidar_projection_fwd_kernel(const uint32_t C, const uint32_t N,
                                   const float *__restrict__ quats,                // [N, 4] optional
                                   const float *__restrict__ scales,               // [N, 3] optional
                                   const float *__restrict__ velocities,           // [N, 3]
+                                  // splatsim sector streaming: per-Gaussian keep mask (nullptr =
+                                  // keep all). Masked Gaussians write radii = 0 and return before
+                                  // touching means/covars, so a host-side cull can hand the FULL
+                                  // arrays over without compacting them (no nonzero/index_select,
+                                  // and crucially no device->host sync per call).
+                                  const bool *__restrict__ valid_mask,            // [N] optional
                                   const float *__restrict__ viewmats,             // [C, 4, 4]
                                   const float min_elevation,
                                   const float max_elevation,
@@ -46,6 +52,11 @@ fully_fused_lidar_projection_fwd_kernel(const uint32_t C, const uint32_t N,
     }
     const uint32_t cid = idx / N; // lidar id
     const uint32_t gid = idx % N; // gaussian id
+
+    if (valid_mask != nullptr && !valid_mask[gid]) {
+        radii[idx * 2] = 0.f;
+        return;
+    }
 
     // shift pointers to the current lidar and gaussian
     means += gid * 3;
@@ -381,6 +392,8 @@ fully_fused_lidar_projection_fwd_tensor(
     const at::optional<torch::Tensor> &quats,  // [N, 4] optional
     const at::optional<torch::Tensor> &scales, // [N, 3] optional
     const at::optional<torch::Tensor> &velocities, // [N, 3] optional
+    // splatsim: optional per-Gaussian keep mask, see the kernel comment
+    const at::optional<torch::Tensor> &valid_mask, // [N] bool optional
     const torch::Tensor &viewmats,             // [C, 4, 4]
     const float min_elevation,
     const float max_elevation,
@@ -405,6 +418,13 @@ fully_fused_lidar_projection_fwd_tensor(
     }
     if (velocities.has_value()) {
         CHECK_INPUT(velocities.value());
+    }
+    if (valid_mask.has_value()) {
+        CHECK_INPUT(valid_mask.value());
+        TORCH_CHECK(valid_mask.value().dtype() == torch::kBool,
+                    "valid_mask must be bool");
+        TORCH_CHECK(valid_mask.value().numel() == means.size(0),
+                    "valid_mask must have one entry per Gaussian");
     }
     CHECK_INPUT(viewmats);
     CHECK_INPUT(linear_velocity);
@@ -434,6 +454,7 @@ fully_fused_lidar_projection_fwd_tensor(
             quats.has_value() ? quats.value().data_ptr<float>() : nullptr,
             scales.has_value() ? scales.value().data_ptr<float>() : nullptr,
             velocities.has_value() ? velocities.value().data_ptr<float>() : nullptr,
+            valid_mask.has_value() ? valid_mask.value().data_ptr<bool>() : nullptr,
             viewmats.data_ptr<float>(),
             min_elevation,
             max_elevation,

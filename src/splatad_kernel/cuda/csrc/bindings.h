@@ -16,6 +16,9 @@ fully_fused_lidar_projection_fwd_tensor(
     const at::optional<torch::Tensor> &quats,  // [N, 4] optional
     const at::optional<torch::Tensor> &scales, // [N, 3] optional
     const at::optional<torch::Tensor> &velocities, // [N, 3]
+    // splatsim: optional per-Gaussian keep mask (sector streaming) — masked
+    // Gaussians get radii = 0 without the host compacting the arrays
+    const at::optional<torch::Tensor> &valid_mask, // [N] bool optional
     const torch::Tensor &viewmats,             // [C, 4, 4]
     const float min_elevation,
     const float max_elevation,
@@ -93,6 +96,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // image size
     const uint32_t image_width, const uint32_t image_height,
     const uint32_t tile_width, const uint32_t tile_height,
+    // splatsim sector rendering: first tile-grid column this image covers
+    const uint32_t tile_col_offset,
+    // splatsim: 16 depth lanes per pixel (forward/inference only)
+    const bool depth_lanes,
     // compute alphas until point
     const bool compute_alpha_sum_until_points,
     const float compute_alpha_sum_until_points_threshold,
@@ -102,7 +109,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // depth channel index
     const uint32_t depth_channel_idx,
     // splatsim: skip zero rolling-shutter / depth-comp terms (static fast path)
-    const bool static_render
+    const bool static_render,
+    // splatsim: host-known "depth_compensations may be nonzero" flag; avoids a
+    // device reduction + sync per rasterization
+    const bool use_depth_comp
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
