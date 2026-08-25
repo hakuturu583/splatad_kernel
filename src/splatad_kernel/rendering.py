@@ -54,6 +54,9 @@ def lidar_rasterization(
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
     channel_chunk: int = 32,
     use_depth_compensation: bool = True,
+    raydrop_sh_coeffs: Optional[Tensor] = None,  # [N, (deg+1)^2 - 1] scalar SH bands l>=1
+    raydrop_sh_degree: int = 0,  # >0 = evaluate view-dependent raydrop and fold into a feature channel
+    raydrop_feature_index: int = 1,  # which lidar_features channel holds the DC raydrop to augment
 ) -> Tuple[Tensor, Tensor, Union[Tensor, None], Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of spherical lidar range images (C).
 
@@ -337,6 +340,48 @@ def lidar_rasterization(
 
     image_width = raster_pts.shape[-2]
     image_height = raster_pts.shape[-3]
+
+    # ── View-dependent raydrop (SH) ──────────────────────────────────────────
+    # Fold the higher SH bands (l>=1) of the raydrop channel into lidar_features,
+    # evaluated at each Gaussian's viewing direction from THIS sensor — mirroring
+    # how the camera path turns colour SH coeffs into per-Gaussian colours before
+    # rasterizing (rendering.py rasterization()). The DC term stays in the feature
+    # channel (`raydrop_feature_index`); only the direction-dependent residual is
+    # added here. A per-Gaussian SCALAR raydrop cannot express ray-dependent drop
+    # (measured drop-recall 0.000); SH gives it direction dependence. Reusing the
+    # camera path's `compute_sh` CUDA op means training (editable install) and the
+    # deployed splatsim renderer share ONE basis convention — no train/deploy skew.
+    if raydrop_sh_degree > 0 and raydrop_sh_coeffs is not None:
+        K = (raydrop_sh_degree + 1) ** 2
+        assert raydrop_sh_coeffs.shape == (N, K - 1), (raydrop_sh_coeffs.shape, K)
+        idx = (
+            raydrop_feature_index
+            if raydrop_feature_index >= 0
+            else D + raydrop_feature_index
+        )
+        # Evaluate SH only for the VISIBLE Gaussians (radii > 0). Culled Gaussians never
+        # reach rasterize_to_points, so their raydrop feature is unused — masking to the
+        # visible set gives bit-identical output while cutting the compute_sh work and the
+        # coeff-tensor allocation from O(N) to O(visible), which for a spherical LiDAR
+        # frame is a small fraction of the whole cloud. compute_sh needs last-dim 3, so we
+        # pack the scalar bands into channel 0 with a ZERO DC term → output ch0 is exactly
+        # sum_{l>=1} basis_l * coeff_l (the direction-dependent residual added to the DC).
+        vis = radii > 0
+        if vis.dim() == 3:
+            vis = vis.any(-1)  # [C, N] (radii may carry a trailing extent dim)
+        camtoworlds = torch.inverse(viewmats)  # [C, 4, 4]
+        lidar_features = lidar_features.clone()
+        for ci in range(C):
+            m = vis[ci]
+            if not bool(m.any()):
+                continue
+            dirs = means[m] - camtoworlds[ci, :3, 3]  # [nv, 3]
+            nv = dirs.shape[0]
+            coeffs = means.new_zeros((nv, K, 3))
+            coeffs[:, 1:, 0] = raydrop_sh_coeffs[m]
+            resid = spherical_harmonics(raydrop_sh_degree, dirs, coeffs)[:, 0]  # [nv]
+            col = lidar_features[ci, :, idx]  # [N] view into the cloned feature buffer
+            col[m] = col[m] + resid
 
     if (lidar_features.shape[-1] + 1) > channel_chunk:
         # slice into chunks
