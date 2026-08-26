@@ -352,6 +352,17 @@ def lidar_rasterization(
     # camera path's `compute_sh` CUDA op means training (editable install) and the
     # deployed splatsim renderer share ONE basis convention — no train/deploy skew.
     if raydrop_sh_degree > 0 and raydrop_sh_coeffs is not None:
+        # sh.cu sh_coeffs_to_color_fast (and its vjp) evaluate through degree 4 only, so bands
+        # from a degree >4 would be allocated + trained-looking but silently dropped with zero
+        # gradient. Reject rather than mis-train (extend sh.cu to raise this cap).
+        _MAX_SH_DEGREE = 4
+        if raydrop_sh_degree > _MAX_SH_DEGREE:
+            raise ValueError(
+                f"raydrop_sh_degree={raydrop_sh_degree} exceeds the kernel maximum "
+                f"{_MAX_SH_DEGREE} (sh.cu evaluates through degree {_MAX_SH_DEGREE}); higher "
+                f"bands would be silently ignored with zero gradient. Lower the degree or "
+                f"extend sh_coeffs_to_color_fast in cuda/csrc/sh.cu."
+            )
         K = (raydrop_sh_degree + 1) ** 2
         assert raydrop_sh_coeffs.shape == (N, K - 1), (raydrop_sh_coeffs.shape, K)
         idx = (
