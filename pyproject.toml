@@ -30,6 +30,13 @@ dependencies = [
     "gsplat",
 ]
 
+[project.optional-dependencies]
+# The WebGPU backend (splatad_kernel.webgpu) needs neither torch nor a CUDA
+# toolkit -- only a WebGPU implementation and numpy. Both are listed here rather
+# than in the core dependencies so that installing the package for the CUDA path
+# does not pull a second GPU stack in.
+webgpu = ["wgpu>=0.19", "numpy"]
+
 [project.urls]
 Homepage = "https://github.com/hakuturu583/splatad_kernel"
 Upstream = "https://github.com/carlinds/splatad"
@@ -50,6 +57,9 @@ splatad_kernel = [
     "cuda/csrc/*.cuh",
     "cuda/csrc/*.cpp",
     "cuda/csrc/*.h",
+    # The WGSL shaders are read at runtime and compiled by the WebGPU driver,
+    # the same way the .cu files are read and compiled by nvcc.
+    "webgpu/shaders/*.wgsl",
 ]
 
 [tool.ruff]

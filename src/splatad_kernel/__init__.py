@@ -18,14 +18,35 @@ PATH. See ``cuda._backend`` for the pre-built ``.so`` path used when shipping
 into an image that has no toolkit.
 """
 
-from splatad_kernel.cuda._wrapper import (
-    fully_fused_lidar_projection,
-    isect_lidar_tiles,
-    isect_offset_encode,
-    rasterize_to_points,
-)
-from splatad_kernel.rendering import lidar_rasterization
 from splatad_kernel.version import __version__
+
+# The CUDA entry points are resolved on first attribute access rather than at
+# import: importing them pulls in torch, and `splatad_kernel.webgpu` -- which
+# needs neither torch nor CUDA -- would otherwise be unable to import on a
+# machine that has no torch installed. Nothing else changes; a name below still
+# resolves to exactly the object it used to.
+_CUDA_EXPORTS = {
+    "fully_fused_lidar_projection": "splatad_kernel.cuda._wrapper",
+    "isect_lidar_tiles": "splatad_kernel.cuda._wrapper",
+    "isect_offset_encode": "splatad_kernel.cuda._wrapper",
+    "rasterize_to_points": "splatad_kernel.cuda._wrapper",
+    "lidar_rasterization": "splatad_kernel.rendering",
+}
+
+
+def __getattr__(name):
+    module = _CUDA_EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    value = getattr(importlib.import_module(module), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_CUDA_EXPORTS))
 
 __all__ = [
     "__version__",
